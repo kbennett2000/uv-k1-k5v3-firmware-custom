@@ -32,7 +32,8 @@ docker run --rm -u $(id -u):$(id -g) -v "$PWD":/src -w /src uvk1-uvk5v3 \
 ```
 
 The dock mode is behind `ENABLE_DOCK`, enabled in the Fusion preset. Flash region is 118 KB and the
-build sits around 87% of it — check the linker's report before adding anything large.
+build sits at 87.8% of it (106,136 B of 120,832 B, 14,696 B free) — check the linker's
+report before adding anything large.
 
 **Builds are reproducible up to a timestamp.** The firmware embeds its build time, so two builds of
 the same commit differ in ~5 bytes. Compare with `cmp -l` before concluding a tree differs.
@@ -40,7 +41,7 @@ the same commit differ in ~5 bytes. Compare with `cmp -l` before concluding a tr
 ## Test
 
 ```sh
-make -C tests/host run       # 98 checks; needs only a C compiler, no Docker, no hardware
+make -C tests/host run       # 144 checks; needs only a C compiler, no Docker, no hardware
 ```
 
 `App/app/dock.c` is deliberately **pure C with no firmware or hardware includes** — all hardware sits

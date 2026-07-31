@@ -140,17 +140,84 @@ static void hal_set_modulation(void *u, uint8_t wire_mod, dock_mod_applied_t *ou
     out->flags      = g_mod_force_flags;
 }
 
+/* set-FM spy (0x0879). Unlike the modulation spy, which echoes what it is handed,
+ * this one MODELS A RECEIVER: it keeps its own on/off, frequency and band, and the
+ * reply is read out of that model. That is deliberate. 0x087A exists to report what
+ * the radio is ON rather than what it was told, and a fake that echoes cannot tell
+ * those two apart — every read-back assertion would pass against a dock.c that simply
+ * copied the request back.
+ *
+ * The three statuses only the radio side can reach are modelled here rather than
+ * forced, because that is where they genuinely live: ERR_OFF (tune with the receiver
+ * off) and ERR_TX / ERR_BAND, which need the firmware's own FUNCTION_* state and the
+ * BK1080 driver's limit tables. */
+static int       g_fm_calls;
+static dock_fm_t g_fm_last;
+static uint8_t   g_fm_force_status;   /* non-zero: refuse the way a HAL might */
+static bool      g_fm_on;             /* what the modelled receiver is doing */
+static uint32_t  g_fm_freq_hz;        /* retained across off, as the firmware does */
+static uint8_t   g_fm_band;
+static uint8_t   g_fm_flags;
+
+static void hal_set_fm(void *u, const dock_fm_t *fm, dock_fm_applied_t *out)
+{
+    (void)u; g_fm_calls++; g_fm_last = *fm;
+
+    if (g_fm_force_status != DOCK_FM_APPLIED) {
+        /* Plausible values on a refusal, deliberately, so the tests can prove dock.c
+         * overwrites them. Both of these are the answer a host most wants to believe:
+         * "the receiver is off" and "band 0". A binding that forgets to blank must not
+         * be able to publish either. */
+        out->status  = g_fm_force_status;
+        out->state   = DOCK_FM_STATE_OFF;
+        out->freq_hz = 103200000u;
+        out->band    = 0u;
+        out->flags   = DOCK_FM_FLAG_TX_OK;
+        return;
+    }
+
+    if (fm->action == DOCK_FM_TUNE && !g_fm_on) {
+        out->status = DOCK_FM_ERR_OFF;   /* dock.c cannot see this; only the radio can */
+        return;                          /* and dock.c blanks the rest */
+    }
+
+    if (fm->action == DOCK_FM_OFF) {
+        g_fm_on = false;
+    } else {
+        g_fm_on      = true;
+        g_fm_freq_hz = fm->freq_hz;
+        g_fm_band    = fm->band;
+    }
+
+    out->status  = DOCK_FM_APPLIED;
+    out->state   = g_fm_on ? DOCK_FM_STATE_ON : DOCK_FM_STATE_OFF;
+    out->freq_hz = g_fm_freq_hz;         /* the firmware keeps it across an off */
+    out->band    = g_fm_band;
+    out->flags   = g_fm_flags;
+}
+
 static const dock_hal_t HAL = {
-    hal_read, hal_write, hal_send, NULL, hal_tx, hal_set_vfo, hal_set_modulation
+    hal_read, hal_write, hal_send, NULL, hal_tx, hal_set_vfo, hal_set_modulation,
+    hal_set_fm
 };
 /* A build with no radio-side binding at all — 0x0873 must still answer. */
 static const dock_hal_t HAL_NO_VFO = {
-    hal_read, hal_write, hal_send, NULL, hal_tx, NULL, hal_set_modulation
+    hal_read, hal_write, hal_send, NULL, hal_tx, NULL, hal_set_modulation,
+    hal_set_fm
 };
 /* A build carrying the set-VFO binding but not the set-modulation one — an F6
  * firmware's shape. 0x0877 must still answer, with ERR_NO_HAL. */
 static const dock_hal_t HAL_NO_MOD = {
-    hal_read, hal_write, hal_send, NULL, hal_tx, hal_set_vfo, NULL
+    hal_read, hal_write, hal_send, NULL, hal_tx, hal_set_vfo, NULL,
+    hal_set_fm
+};
+/* A build with the set-modulation binding but not the set-FM one — an F7 firmware's
+ * shape, and also a Fusion-preset-without-ENABLE_FMRADIO build. 0x0879 must still
+ * answer, with ERR_NO_HAL, rather than fall through to the silence that means
+ * "this firmware does not have the command at all". */
+static const dock_hal_t HAL_NO_FM = {
+    hal_read, hal_write, hal_send, NULL, hal_tx, hal_set_vfo, hal_set_modulation,
+    NULL
 };
 
 /* Decode the one 0x0874 reply in the capture buffer. False unless exactly one
@@ -194,6 +261,27 @@ static bool last_mod_reply(dock_mod_applied_t *out)
     return true;
 }
 
+/* Decode the one 0x087A reply in the capture buffer. Same "exactly one well-formed
+ * frame or false" rule as the two above — silence must never read as a pass. */
+#define FM_REPLY_FRAME_LEN 20u   /* AB CD | size:2 | (4 + 8 + 2) | DC BA */
+
+static bool last_fm_reply(dock_fm_applied_t *out)
+{
+    if (g_caplen != FM_REPLY_FRAME_LEN) return false;
+    uint8_t body[4 + 8 + 2];
+    memcpy(body, g_cap + 4, sizeof(body));
+    dock_obfuscate(body, (uint16_t)sizeof(body));
+    if ((uint16_t)(body[0] | (body[1] << 8)) != DOCK_REPLY_SET_FM) return false;
+    if ((uint16_t)(body[2] | (body[3] << 8)) != 8u) return false;
+    out->status  = body[4];
+    out->state   = body[5];
+    out->freq_hz = (uint32_t)body[6] | ((uint32_t)body[7] << 8)
+                 | ((uint32_t)body[8] << 16) | ((uint32_t)body[9] << 24);
+    out->band    = body[10];
+    out->flags   = body[11];
+    return true;
+}
+
 static dock_ctx_t ctx;
 
 static void reset(void)
@@ -207,6 +295,13 @@ static void reset(void)
     g_mod_force_status = DOCK_MOD_APPLIED;
     g_mod_force_readback = -1; g_mod_force_raw = -1;
     g_mod_force_flags = DOCK_MOD_FLAG_TX_OK;
+    g_fm_calls = 0; memset(&g_fm_last, 0, sizeof(g_fm_last));
+    g_fm_force_status = DOCK_FM_APPLIED;
+    /* The modelled receiver starts OFF on band 0 with nothing tuned — a radio nobody
+     * has put into broadcast FM, which is the state every real one boots into
+     * (board.c powers the BK1080 down at BOARD_Init). */
+    g_fm_on = false; g_fm_freq_hz = 0u; g_fm_band = 0u;
+    g_fm_flags = DOCK_FM_FLAG_TX_OK;
     dock_init(&ctx, &HAL);
 }
 
@@ -235,6 +330,18 @@ static uint16_t build_cmd(uint8_t *out, uint16_t opcode,
 static void feed(const uint8_t *buf, uint16_t len)
 {
     for (uint16_t i = 0; i < len; i++) dock_rx_byte(&ctx, buf[i]);
+}
+
+/* 0x0879 params: [action:u8][freq_hz:u32 LE][band:u8]. */
+static uint16_t p_fm(uint8_t *p, uint8_t action, uint32_t hz, uint8_t band)
+{
+    p[0] = action;
+    p[1] = (uint8_t)(hz & 0xFF);
+    p[2] = (uint8_t)((hz >> 8) & 0xFF);
+    p[3] = (uint8_t)((hz >> 16) & 0xFF);
+    p[4] = (uint8_t)((hz >> 24) & 0xFF);
+    p[5] = band;
+    return DOCK_SET_FM_PARAM_LEN;
 }
 
 /* little-endian param builders */
@@ -885,6 +992,337 @@ int main(void)
     flen = build_cmd(frame, 0x087Fu, MOD_AM, sizeof(MOD_AM));
     feed(frame, flen);
     CHECK(g_caplen == 0, "unknown opcode: still no reply, so absence stays detectable");
+
+    /* ================= 0x0879 / 0x087A — broadcast FM, the BK1080 (F8) =========
+     *
+     * A different chip from everything above. These tests are about three things the
+     * other opcodes do not have to care about: a frequency raster that must be
+     * refused rather than rounded, a band field the firmware would silently clamp,
+     * and a receiver whose state the reply has to READ rather than echo.
+     */
+    dock_fm_applied_t frep;
+    const uint32_t HZ_1032 = 103200000u;   /* 103.2 MHz — on the 100 kHz raster */
+
+    /* 39. Byte-exact COMMAND vector. As with test 25 this exercises the harness's own
+     *     builder rather than dock.c's dispatch — it is the artifact a third-party
+     *     client is implemented against, and it is published in PROTOCOL.md. Derived
+     *     from a reference framer written separately from dock.c, which reproduces the
+     *     two already-published F7 vectors byte-for-byte before being trusted here. */
+    reset();
+    {
+        static const uint8_t golden[] = {
+            0xAB, 0xCD, 0x0A, 0x00,
+            0x6F, 0x64, 0x12, 0xE6, 0x2F, 0x91, 0xB8, 0x66, 0x27, 0x35, 0x9A, 0x85,
+            0xDC, 0xBA,
+        };
+        plen = p_fm(params, DOCK_FM_ON, HZ_1032, 0u);
+        flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+        CHECK(flen == sizeof(golden), "0x0879: golden command length");
+        CHECK(flen == sizeof(golden) && memcmp(frame, golden, sizeof(golden)) == 0,
+              "0x0879: byte-exact command vector");
+    }
+
+    /* 40. Byte-exact REPLY vector, for the same reason and with the same provenance. */
+    reset();
+    plen = p_fm(params, DOCK_FM_ON, HZ_1032, 0u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    {
+        static const uint8_t golden[] = {
+            0xAB, 0xCD, 0x0C, 0x00,
+            0x6C, 0x64, 0x1C, 0xE6, 0x2E, 0x90, 0x0D, 0xF5, 0x07, 0x33, 0xD5, 0x41,
+            0xEC, 0xFC,
+            0xDC, 0xBA,
+        };
+        CHECK(g_caplen == sizeof(golden), "0x087A: golden reply length");
+        CHECK(g_caplen == sizeof(golden) &&
+              memcmp(g_cap, golden, sizeof(golden)) == 0,
+              "0x087A: byte-exact reply vector");
+    }
+
+    /* 41. Short payload is refused before a single field is decoded, which is what
+     *     makes an EMPTY 0x0879 a safe firmware-level probe: it cannot move the
+     *     receiver, and it cannot take the speaker away from the station. */
+    reset();
+    {
+        /* Both halves of the probe exchange are PUBLISHED in PROTOCOL.md, so both are
+         * pinned here rather than left as a derivation nobody checked. */
+        static const uint8_t probe[] = {
+            0xAB, 0xCD, 0x04, 0x00, 0x6F, 0x64, 0x14, 0xE6, 0x8D, 0x89, 0xDC, 0xBA,
+        };
+        flen = build_cmd(frame, DOCK_CMD_SET_FM, params, 0);
+        CHECK(flen == sizeof(probe) && memcmp(frame, probe, sizeof(probe)) == 0,
+              "0x0879: byte-exact empty-payload probe vector");
+    }
+    feed(frame, flen);
+    CHECK(g_fm_calls == 0, "0x0879: an empty payload is refused, not read past");
+    CHECK(last_fm_reply(&frep) && frep.status == DOCK_FM_ERR_SHORT,
+          "0x087A: a short payload is REPORTED, so the probe gets an answer");
+    CHECK(frep.state == DOCK_FM_STATE_UNKNOWN && frep.band == DOCK_FM_BAND_UNKNOWN
+          && frep.freq_hz == 0u,
+          "0x087A: a refusal names no state and no band — 0xFF, never 0 (0 is OFF, and band 0)");
+    {
+        static const uint8_t golden[] = {
+            0xAB, 0xCD, 0x0C, 0x00,
+            0x6C, 0x64, 0x1C, 0xE6, 0x2F, 0x6E, 0x0D, 0x40, 0x21, 0x35, 0x2A, 0x40,
+            0xEC, 0xFC,
+            0xDC, 0xBA,
+        };
+        CHECK(g_caplen == sizeof(golden) &&
+              memcmp(g_cap, golden, sizeof(golden)) == 0,
+              "0x087A: byte-exact probe-refusal vector");
+    }
+
+    /* 42. Full-control is named rather than ignored, and released cleanly. */
+    reset();
+    flen = build_cmd(frame, DOCK_CMD_ENTER_HW, params, 0); feed(frame, flen);
+    g_caplen = 0;
+    plen = p_fm(params, DOCK_FM_ON, HZ_1032, 0u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    CHECK(g_fm_calls == 0, "0x0879: refused while the host holds full-control");
+    CHECK(last_fm_reply(&frep) && frep.status == DOCK_FM_ERR_BUSY,
+          "0x087A: full-control is named, so the caller can retry after 0x0871");
+
+    flen = build_cmd(frame, DOCK_CMD_EXIT_HW, params, 0); feed(frame, flen);
+    g_caplen = 0;
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    CHECK(g_fm_calls == 1, "0x0879: accepted once full-control is released");
+    CHECK(last_fm_reply(&frep) && frep.status == DOCK_FM_APPLIED,
+          "0x087A: applied after full-control is released");
+
+    /* 43. THE ONE THIS OPCODE EXISTS TO GET RIGHT: a frequency off the 100 kHz raster
+     *     is REFUSED, not rounded. 103.25 MHz is not "nearly 103.2" — on the broadcast
+     *     band the next raster step is a whole different station, and a host that asked
+     *     for one and silently got the other has no way to find out. 0x0873 truncates
+     *     sub-10 Hz detail because 10 Hz of a repeater channel is nothing; this is not
+     *     that, and the difference is the reason this is a separate opcode. */
+    reset();
+    plen = p_fm(params, DOCK_FM_ON, 103250000u, 0u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    CHECK(g_fm_calls == 0, "0x0879: an off-raster frequency never reaches the radio");
+    CHECK(last_fm_reply(&frep) && frep.status == DOCK_FM_ERR_FIELD,
+          "0x087A: an off-raster frequency is refused, never rounded to the nearest station");
+    CHECK(!g_fm_on, "0x0879: a refused frequency leaves the receiver where it was");
+
+    /* 44. A band number the firmware's two-bit field would silently truncate. Band 4
+     *     assigned to `uint8_t FM_Band : 2` becomes band 0 with no diagnostic — the
+     *     radio lands on 87.5-108 while the host believes otherwise. Refused here, on
+     *     the wire's own scale, before any binding sees it. */
+    reset();
+    plen = p_fm(params, DOCK_FM_ON, HZ_1032, 4u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    CHECK(g_fm_calls == 0, "0x0879: a band the firmware would truncate never reaches it");
+    CHECK(last_fm_reply(&frep) && frep.status == DOCK_FM_ERR_FIELD,
+          "0x087A: an out-of-range band is refused, not clamped to 0");
+
+    /* 45. An action this firmware does not accept. Same shape as 0x0877's USB refusal:
+     *     the number is refused now and can be accepted later, additively. */
+    reset();
+    plen = p_fm(params, 3u, HZ_1032, 0u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    CHECK(g_fm_calls == 0, "0x0879: an unknown action never reaches the radio");
+    CHECK(last_fm_reply(&frep) && frep.status == DOCK_FM_ERR_FIELD,
+          "0x087A: an unknown action is named");
+
+    /* 46. Refused while the DOCK ITSELF holds the key. This is the guard the radio's
+     *     own ACTION_FM cannot provide: it tests gCurrentFunction, and Dock_ForceTx
+     *     keys by writing REG_30 without ever entering FUNCTION_Select, so the
+     *     firmware's own check sees an idle radio mid-over. ctx->tx_on is the only
+     *     state that knows, and it lives here — which is also why this is the one new
+     *     refusal a host test can prove. Turning the receiver on here would raise the
+     *     speaker amp into a live mic and flip the LNA GPIOs mid-transmission. */
+    reset();
+    {
+        static const uint16_t key_on[] = { 0x30u, 0xC1FEu };
+        plen = p_write(params, key_on, 1);
+        flen = build_cmd(frame, DOCK_CMD_WRITE_REGS, params, plen);
+        feed(frame, flen);
+    }
+    CHECK(ctx.tx_on, "0x0850: the key is up, so the FM refusal below is the real case");
+    g_caplen = 0;
+    plen = p_fm(params, DOCK_FM_ON, HZ_1032, 0u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    CHECK(g_fm_calls == 0, "0x0879: refused while the dock holds the transmitter keyed");
+    CHECK(last_fm_reply(&frep) && frep.status == DOCK_FM_ERR_TX,
+          "0x087A: keyed is its OWN status, not BUSY — BUSY already means full-control");
+
+    /* 47. TUNE is not a cheaper ON. A host stepping across the band must never be able
+     *     to switch the station deaf by accident, so tuning a receiver that is off is
+     *     refused rather than promoted. Only the radio side can see this, so it is the
+     *     HAL that reports it — and dock.c still blanks the reply. */
+    reset();
+    plen = p_fm(params, DOCK_FM_TUNE, HZ_1032, 0u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    CHECK(g_fm_calls == 1, "0x0879: TUNE reaches the radio — only it knows if FM is on");
+    CHECK(last_fm_reply(&frep) && frep.status == DOCK_FM_ERR_OFF,
+          "0x087A: TUNE on a receiver that is off is refused, not promoted to an ON");
+    CHECK(frep.state == DOCK_FM_STATE_UNKNOWN && frep.freq_hz == 0u,
+          "0x087A: and that refusal still ships no state claim");
+
+    /* 48. A frequency outside the named band's own limits. dock.c cannot check this —
+     *     the limits live in the BK1080 driver's tables and a second copy here would be
+     *     a drift hazard — so it is a HAL verdict, reported through the same reply.
+     *     64.0 MHz is legal on band 3 and below band 0's floor of 87.5. */
+    reset();
+    g_fm_force_status = DOCK_FM_ERR_BAND;
+    plen = p_fm(params, DOCK_FM_ON, 64000000u, 0u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    CHECK(last_fm_reply(&frep) && frep.status == DOCK_FM_ERR_BAND,
+          "0x087A: out-of-band is reported by the radio side, which owns the limits");
+
+    /* 49. A build without the binding still answers. An F7 firmware, or a Fusion build
+     *     with ENABLE_FMRADIO off, must say ERR_NO_HAL rather than fall through to the
+     *     silence that means "this firmware does not have 0x0879 at all". Those two are
+     *     different facts and a host acts differently on them. */
+    reset();
+    dock_init(&ctx, &HAL_NO_FM);
+    plen = p_fm(params, DOCK_FM_ON, HZ_1032, 0u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    CHECK(g_caplen == FM_REPLY_FRAME_LEN, "0x087A: a missing binding still replies");
+    CHECK(last_fm_reply(&frep) && frep.status == DOCK_FM_ERR_NO_HAL,
+          "0x087A: a missing set_fm binding is reported, not silent");
+
+    /* 50. A rejection never describes the receiver — enforced in dock.c, not left to
+     *     each binding. The fake writes "off, band 0, 103.2, and you can transmit" on
+     *     its refusal on purpose: every one of those is what a host wants to hear, and
+     *     none of them may be published by a frame that says it refused. */
+    reset();
+    g_fm_force_status = DOCK_FM_ERR_BAND;
+    plen = p_fm(params, DOCK_FM_ON, HZ_1032, 0u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    CHECK(last_fm_reply(&frep) && frep.status == DOCK_FM_ERR_BAND,
+          "0x087A: a refusal from the radio side is reported");
+    CHECK(frep.state == DOCK_FM_STATE_UNKNOWN && frep.band == DOCK_FM_BAND_UNKNOWN
+          && frep.freq_hz == 0u && frep.flags == 0,
+          "0x087A: a non-zero status ships no state, band, frequency or TX claim, whatever the HAL wrote");
+
+    /* 51. A valid frame reaches the binding exactly once, and does nothing else.
+     *     NOTE, as for test 31: this stays green against a stub that skips every check.
+     *     It discriminates against a dispatch that never calls the binding or calls it
+     *     twice, not against one that fails to validate. Tests 41-48 are that. */
+    reset();
+    plen = p_fm(params, DOCK_FM_ON, HZ_1032, 2u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    CHECK(g_fm_calls == 1 && g_fm_last.action == DOCK_FM_ON
+          && g_fm_last.freq_hz == HZ_1032 && g_fm_last.band == 2u,
+          "0x0879: a valid frame reaches the binding exactly once, with the values sent");
+    CHECK(g_writes == 0 && g_reads == 0 && g_vfo_calls == 0 && g_mod_calls == 0,
+          "0x0879: no register traffic, no set-VFO and no set-modulation of its own");
+    CHECK(g_tx_calls == 0 && !ctx.tx_on, "0x0879: no PA activity of its own");
+
+    /* 52. The reply REPORTS, it does not echo. The modelled receiver refuses to leave
+     *     87.5 — the way a radio whose band was changed under it would — and the reply
+     *     must carry where it actually is, not where it was sent. This is 0x0874's
+     *     doctrine and the reason the fake models a receiver instead of echoing. */
+    reset();
+    plen = p_fm(params, DOCK_FM_ON, HZ_1032, 0u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    g_fm_freq_hz = 87500000u;                     /* it drifted back, as radios do */
+    g_caplen = 0;
+    plen = p_fm(params, DOCK_FM_TUNE, HZ_1032, 0u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    CHECK(last_fm_reply(&frep) && frep.status == DOCK_FM_APPLIED,
+          "0x087A: a TUNE on a running receiver applies");
+    CHECK(frep.freq_hz == HZ_1032 && frep.state == DOCK_FM_STATE_ON,
+          "0x087A: the frequency is read back from the receiver, in the same Hz that were sent");
+
+    /* 53. OFF turns it off and says so, and the receiver keeps the frequency it was on
+     *     — exactly as gEeprom.FM_FrequencyPlaying does across an off. A `state` of OFF
+     *     is the host's only signal that the station can hear its own channel again. */
+    reset();
+    plen = p_fm(params, DOCK_FM_ON, HZ_1032, 0u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    CHECK(last_fm_reply(&frep) && frep.state == DOCK_FM_STATE_ON,
+          "0x087A: ON reports ON — the station is now deaf to its own channel");
+    g_caplen = 0;
+    plen = p_fm(params, DOCK_FM_OFF, 0u, 0u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    CHECK(last_fm_reply(&frep) && frep.status == DOCK_FM_APPLIED
+          && frep.state == DOCK_FM_STATE_OFF,
+          "0x087A: OFF reports OFF");
+    CHECK(frep.freq_hz == HZ_1032,
+          "0x087A: and the receiver keeps its frequency across an off, as the firmware does");
+
+    /* 53b. OFF is never refused for a field it does not use. Turning the receiver off
+     *      is how a host gives the station its ears back, so a stale frequency or an
+     *      out-of-range band in a payload whose action is OFF must not block it — both
+     *      of which would be refused outright on an ON. Same instinct as radio-server's
+     *      ADR 0151: the direction that restores the radio always stays available. */
+    reset();
+    plen = p_fm(params, DOCK_FM_ON, HZ_1032, 0u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    CHECK(g_fm_on, "0x0879: the receiver is on, so the OFF below is the real case");
+    g_caplen = 0;
+    plen = p_fm(params, DOCK_FM_OFF, 103250000u, 7u);   /* both fields are junk */
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    CHECK(last_fm_reply(&frep) && frep.status == DOCK_FM_APPLIED
+          && frep.state == DOCK_FM_STATE_OFF,
+          "0x087A: OFF is not refused for an off-raster frequency or a bad band it ignores");
+    CHECK(!g_fm_on, "0x0879: and the receiver really did stop");
+
+    /* 54. The TX_OK flag is carried and is NOT about broadcast FM. It reports whether
+     *     the radio will key its own transmit path — fed by the BK4819 demodulator,
+     *     which the BK1080 does not touch. A host must be able to read "playing
+     *     broadcast FM" and "will transmit normally" off the same frame, because that
+     *     combination is the actual state of this radio and it is the dangerous one. */
+    reset();
+    plen = p_fm(params, DOCK_FM_ON, HZ_1032, 0u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    CHECK(last_fm_reply(&frep) && frep.state == DOCK_FM_STATE_ON
+          && (frep.flags & DOCK_FM_FLAG_TX_OK) != 0,
+          "0x087A: deaf and still able to transmit is representable, because it is real");
+
+    reset();
+    g_fm_flags = 0u;                              /* the BK4819 is on AM */
+    plen = p_fm(params, DOCK_FM_ON, HZ_1032, 0u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    CHECK(last_fm_reply(&frep) && (frep.flags & DOCK_FM_FLAG_TX_OK) == 0,
+          "0x087A: and a radio that cannot key says so on this frame too");
+
+    /* 55. The F7 and F6 goldens are unmoved. 0x0879 added a member to dock_hal_t and a
+     *     case to the dispatch; neither may shift a byte of a frame already shipped and
+     *     already implemented against by radio-server's frames.py. */
+    reset();
+    g_mod_force_flags = 0;                        /* as test 26 — AM will not key */
+    flen = build_cmd(frame, DOCK_CMD_SET_MODULATION, MOD_AM, sizeof(MOD_AM));
+    feed(frame, flen);
+    {
+        static const uint8_t golden[] = {
+            0xAB, 0xCD, 0x08, 0x00,
+            0x6E, 0x64, 0x10, 0xE6, 0x2E, 0x90, 0x0C, 0x40, 0xDE, 0xCA,
+            0xDC, 0xBA,
+        };
+        CHECK(g_caplen == sizeof(golden) &&
+              memcmp(g_cap, golden, sizeof(golden)) == 0,
+              "0x0878: F7's golden reply is byte-identical after F8");
+    }
+
+    /* 56. And an unknown opcode adjacent to the new one is still silent, so the
+     *     firmware-level probe keeps working one level up. */
+    reset();
+    plen = p_fm(params, DOCK_FM_ON, HZ_1032, 0u);
+    flen = build_cmd(frame, 0x087Bu, params, plen);
+    feed(frame, flen);
+    CHECK(g_caplen == 0, "0x087B: unknown opcode beside 0x0879 is still answered with silence");
 
     /* ---- report ---- */
     printf("dock host tests: %d checks, %d failures\n", g_checks, g_fail);

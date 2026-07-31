@@ -57,6 +57,13 @@ void    FM_ProcessKeys(KEY_Code_t Key, bool bKeyPressed, bool bKeyHeld);
 void    FM_Play(void);
 void    FM_Start(void);
 
+// Both already exist and are already non-static in fm.c; they simply had no prototype,
+// because until now only fm.c called them. Declared here so app/uart.c's dock glue can
+// bring the receiver up and retune it without a flash write of its own (F8) — see the
+// 0x0879 note in app/dock.h.
+void    FM_SetFrequency(void);
+void    FM_AudioPathOn(void);
+
 #endif
 
 #endif

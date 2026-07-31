@@ -91,7 +91,7 @@ costs about 1 KB of it.
 ## Test
 
 ```sh
-make -C tests/host run      # 66 checks, needs only a C compiler
+make -C tests/host run      # 144 checks, needs only a C compiler
 ```
 
 `App/app/dock.c` is pure C with no firmware or hardware includes — all hardware sits behind a

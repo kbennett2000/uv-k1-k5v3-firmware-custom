@@ -247,6 +247,75 @@ exactly the class of surprise this file exists to prevent.
 
 ---
 
+## F8 — broadcast FM, the BK1080 (`0x0879`/`0x087A`)
+
+**This level has never been flashed either.** Everything below is read out of the firmware. The
+BK1080 is a second receiver chip and nothing about it has been exercised over this wire.
+
+### 8. Broadcast FM audio actually reaches the AIOC  ⚠ CONFIRM AT BENCH
+
+Send `0x0879` with `action = 1`, `freq_hz = 103200000`, `band = 0` (substitute a station that is
+actually strong where the radio is). Expected: `0x087A` status `0`, `state = 1`, `freq_hz`
+`103200000` read back, `band = 0`.
+
+1. **The radio's screen switches to the FM display.** The glue calls `GUI_SelectNextDisplay` directly,
+   so this is a free visual check independent of the reply.
+2. **Audio comes out of the AIOC**, not just out of the speaker. The F3a lesson again, and it is the
+   whole point of the feature: registers reading back correct proves nothing about audio reaching the
+   cable. `doctor --rx-level` should read a real signal.
+3. **It survives a tune.** Send `0x0873` afterwards; the broadcast audio must still be there. This is
+   what `Dock_RestoreFmAudio` exists for and it is the one thing the host tests provably cannot see,
+   because `uart.c` is not host-compiled.
+4. **It survives `0x0870`/`0x0871`.** Same reason.
+5. **`action = 2` retunes without a gap** and without the display changing.
+6. **`action = 0` gives the channel back.** After the off, normal channel receive audio must return.
+
+`⚠ CONFIRM AT BENCH`: whether broadcast FM audio over the AIOC needs any gain change relative to
+normal channel receive. Unknown. Do not guess a number here.
+
+### 9. The station is deaf while this is on, and still transmits  ⚠ CONFIRM AT BENCH
+
+**Read from the source, not observed**, and it is the reason ADR 0156 is named what it is. Nothing in
+`RADIO_PrepareTX` consults `gFmRadioMode`; the key filter whitelists `KEY_PTT`; `GENERIC_Key_PTT`
+jumps to `start_tx` on the FM screen.
+
+With a **dummy load**:
+
+1. Turn broadcast FM on over `0x0879`. Confirm `state = 1` **and** `flags` bit 0 = 1.
+2. Confirm the radio hears nothing of its own channel — key a second radio on the tuned channel and
+   confirm no channel audio reaches the AIOC.
+3. Press the radio's own PTT. Expected: **it transmits.** Confirm it does.
+4. Assert the AIOC's DTR line. Expected: **also transmits.**
+5. Confirm the broadcast audio returns by itself a few seconds after the over ends — the firmware's
+   own `gFM_RestoreCountdown_10ms` path.
+
+`⚠ CONFIRM AT BENCH`: whether an over taken while broadcast FM is on sounds normal at the far end.
+The firmware powers the BK1080 down on key-up, so it should, but that is inference.
+
+### 10. Refusal while keyed, and the flash behaviour  ⚠ CONFIRM AT BENCH
+
+1. Key via `0x0850` REG_30, then send `0x0879` `action = 1`. Expected: `0x087A` status `8`, and the
+   receiver does **not** come up. Un-key and retry; expected: status `0`.
+2. Press and hold the radio's own PTT, then send the same. Expected: status `8` again — this is the
+   other half of the guard, and it is a different code path.
+3. Send `action = 2` with the receiver off. Expected: status `9`, and nothing moves.
+4. Send `freq_hz = 103250000` (off the 100 kHz raster). Expected: status `4`, and the receiver does
+   not move. **This is the one worth checking with the radio in front of you**: a rounded broadcast
+   frequency is a different station, and the whole design turns on refusing it.
+
+`⚠ CONFIRM AT BENCH`: **how long the `action = 0` leg actually stalls.** It calls
+`SETTINGS_WriteCurrentState`, whose flash path may erase a sector; `App/driver/py25q16.c`'s own
+comment says *"Erase takes ~300ms"* and that comment is the only source — nobody has measured it.
+Time it, and confirm nothing on the radio misbehaves during the stall. Do not write a number here
+from the comment.
+
+`⚠ CONFIRM AT BENCH`: that a power cycle after an `action = 0` comes up **normally**, not into
+broadcast FM. That is what the OFF-leg write is for. Then confirm the residual: pull the cable while
+broadcast FM is on, power cycle, and expect the radio to come up **in broadcast FM** — a known,
+recorded consequence with its fix scheduled for the host side, not a surprise.
+
+---
+
 ## Notes / open items
 - Once Kris confirms the `⚠ CONFIRM AT BENCH` items, replace each placeholder with the
   real value and delete the provenance banner.
