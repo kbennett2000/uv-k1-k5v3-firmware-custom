@@ -79,8 +79,8 @@ void dock_init(dock_ctx_t *ctx, const dock_hal_t *hal)
     ctx->len          = 0;
 }
 
-/* Longest parameter block this core replies with (0x0874's 12; 0x0878 uses 4, and
- * so does 0x0951). Named rather than implied by the largest caller, because
+/* Longest parameter block this core replies with (0x0874's 12; 0x087A uses 8; 0x0878
+ * uses 4, and so does 0x0951). Named rather than implied by the largest caller, because
  * dock_send_payload SILENTLY SENDS NOTHING for a longer block — so a new reply that
  * does not fit would look exactly like a firmware that never got the command. */
 #define DOCK_REPLY_MAX_PARAMS 12u

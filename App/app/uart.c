@@ -47,6 +47,7 @@
 
 #ifdef ENABLE_DOCK
 #include "app/dock.h"
+#include "app/dock_tx_interlock.h"  // F9: the one predicate RADIO_PrepareTX also refuses on
 #include "driver/system.h"
 #include "radio.h"
 #if defined(ENABLE_FMRADIO)
@@ -1230,12 +1231,26 @@ static void Dock_SetFm(void *user, const dock_fm_t *fm, dock_fm_applied_t *out)
     out->state   = gFmRadioMode ? DOCK_FM_STATE_ON : DOCK_FM_STATE_OFF;
     out->freq_hz = (uint32_t)gEeprom.FM_FrequencyPlaying * DOCK_FM_RASTER_HZ;
     out->band    = gEeprom.FM_Band;
-    // Same bit and same meaning as 0x0878's, and deliberately NOT about broadcast FM:
-    // it is the BK4819 demodulator that decides whether this radio will key its own PTT
-    // path, and the BK1080 does not touch it. Reported here so a host holding only this
-    // frame can see the real and dangerous combination — deaf, and still transmitting.
-    out->flags   = Dock_ModulationCanTx(gEeprom.VfoInfo[0].Modulation)
-                 ? DOCK_FM_FLAG_TX_OK : 0u;
+    // Bit 0: same bit and same meaning as 0x0878's, and deliberately NOT about broadcast
+    // FM. It is the BK4819 demodulator that decides whether this radio will key its own
+    // PTT path, and the BK1080 does not touch it.
+    //
+    // Bit 1 (F9): whether broadcast FM is blocking transmit on THIS BUILD, right now.
+    // Read the two together — will_key = TX_OK && !FM_BLOCKS_TX — because the pair that
+    // used to be the whole hazard (deaf and still transmitting) is now only one of four
+    // real states, and a host that reads bit 0 alone gets exactly that one wrong.
+    //
+    // Both bits are read back AFTER the action applied, never derived from the request:
+    // an OFF that succeeded reports not-blocked because the receiver really has stopped.
+    // The condition behind bit 1 is NOT written here — it is Dock_BroadcastFmBlocksTx()
+    // in app/dock_tx_interlock.h, the same predicate RADIO_PrepareTX refuses on. That is
+    // the one thing F7 did not do for TX_OK (Dock_ModulationCanTx above is a hand copy of
+    // radio.c's AM gate), and it is why an image built WITHOUT the interlock reports 0
+    // here automatically and truthfully: it will in fact key while playing broadcast FM.
+    out->flags   = (Dock_ModulationCanTx(gEeprom.VfoInfo[0].Modulation)
+                    ? DOCK_FM_FLAG_TX_OK : 0u)
+                 | (Dock_BroadcastFmBlocksTx()
+                    ? DOCK_FM_FLAG_FM_BLOCKS_TX : 0u);
     out->status  = DOCK_FM_APPLIED;
 }
 #endif // ENABLE_FMRADIO

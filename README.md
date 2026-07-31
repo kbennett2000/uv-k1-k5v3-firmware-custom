@@ -72,12 +72,6 @@ Each cycle unlocked something the one before it lacked. Releases are tagged `rad
 that cost a diagnostic cycle each to find, and neither is visible from the host as a fault — the radio
 reports success and does nothing. If you are debugging a silent radio, check the level first.
 
-> ⚠️ **F9 is not on `main` yet.** `main` is F8 (merge `d086a23`); F9 lives on branch
-> **`f9-fm-tx-interlock`** ([PR #7](../../pull/7)) and in the pre-release
-> **[`radio-server-f9-v5.7.0`](../../releases/tag/radio-server-f9-v5.7.0)**. **A build from `main`
-> has the broadcast-FM commands but not the transmit interlock, so it will key while the BK1080 is
-> playing** — flash the pre-release, or build from the branch, if you want the radio to stop itself.
-
 ## Build
 
 ```sh
@@ -99,7 +93,7 @@ costs about 1 KB of it.
 ## Test
 
 ```sh
-make -C tests/host run      # 144 checks, needs only a C compiler
+make -C tests/host run      # 161 checks, needs only a C compiler
 ```
 
 `App/app/dock.c` is pure C with no firmware or hardware includes — all hardware sits behind a

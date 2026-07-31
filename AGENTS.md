@@ -32,7 +32,7 @@ docker run --rm -u $(id -u):$(id -g) -v "$PWD":/src -w /src uvk1-uvk5v3 \
 ```
 
 The dock mode is behind `ENABLE_DOCK`, enabled in the Fusion preset. Flash region is 118 KB and the
-build sits at 87.8% of it (106,136 B of 120,832 B, 14,696 B free) — check the linker's
+build sits at 87.9% of it (106,152 B of 120,832 B, 14,680 B free) — check the linker's
 report before adding anything large.
 
 **Builds are reproducible up to a timestamp.** The firmware embeds its build time, so two builds of
@@ -41,7 +41,7 @@ the same commit differ in ~5 bytes. Compare with `cmp -l` before concluding a tr
 ## Test
 
 ```sh
-make -C tests/host run       # 144 checks; needs only a C compiler, no Docker, no hardware
+make -C tests/host run       # 161 checks; needs only a C compiler, no Docker, no hardware
 ```
 
 `App/app/dock.c` is deliberately **pure C with no firmware or hardware includes** — all hardware sits
@@ -83,6 +83,8 @@ Releases are tagged `radio-server-fN-v5.7.0`; branches `fN-*` are kept for histo
 | **F5** | engages the PA on the key-up edge | keys cleanly, **radiates nothing usable** |
 | **F6** | `0x0873`/`0x0874` set-VFO | tuning does not survive `0x0871`; no power control |
 | **F7** | `0x0877`/`0x0878` set-modulation; `0x0873` stops forcing FM | the radio is FM-only — no way to receive AM |
+| **F8** | `0x0879`/`0x087A` set-broadcast-FM (the BK1080) | no way to reach or silence the second receiver |
+| **F9** | refuses TX while broadcast FM runs (`ENABLE_DOCK_FM_TX_INTERLOCK`, Fusion only) | the radio transmits into a channel it cannot hear |
 
 None of F3 or F5's absence looks like a fault from the host — the radio reports success and does
 nothing. When something is silent, check the level first.
@@ -103,10 +105,21 @@ nothing. When something is silent, check the level first.
 3. **Any non-zero reply status blanks the frequency fields** — enforced in `dock.c`, not left to each
    HAL, so no binding can publish a channel the radio is not on.
 4. **Keep `dock.c` free of firmware includes.** Hardware goes behind `dock_hal_t`.
-5. **Touch as little of upstream as possible.** Thirteen files differ from `3bd3ebb`; four of them are
-   upstream files that gained a dispatch case, a HAL binding and a build flag. Nothing in the radio's
-   own operation changes until a host sends `0x0870`. Keep it that way — it is what makes rebasing on
-   a new F4HWN release tractable.
+5. **Touch as little of upstream as possible.** Nineteen files differ from `3bd3ebb`
+   (`git diff --name-only 3bd3ebb -- . | grep -v '^build/'`, plus the two F9 added); **five** are
+   upstream files rather than ours, and between them they gained a dispatch case, a HAL binding, two
+   build flags and — at F9 — one clause in `RADIO_PrepareTX`. Keep it that way: it is what makes
+   rebasing on a new F4HWN release tractable. (The count was stated as thirteen through F8 and was
+   already stale then; it is measured here rather than incremented.)
+
+   **F9 is the one deliberate exception to "nothing changes until a host sends `0x0870`", and it is
+   confined.** The broadcast-FM transmit interlock has to work with no host at all — that is the whole
+   point of it, since a host gate cannot see the front panel and dies with the process. So it changes
+   the radio's own operation, and it is behind `ENABLE_DOCK_FM_TX_INTERLOCK`, **on in `Fusion` only**.
+   The six editions this fork does not ship keep upstream's behaviour exactly. Note the polarity is
+   the opposite of upstream's `ENABLE_TX_WHEN_AM` (opt-in, not opt-out) because the provenance is the
+   opposite: that is F4HWN's behaviour behind F4HWN's flag, this is ours behind ours. The
+   `ENABLE_DOCK_` prefix is the tell. Do not "fix" the inconsistency.
 6. **Licence hygiene.** Apache-2.0. The dock port derives from nicsure's Apache-2.0 `quansheng-dock-fw`;
    its GPL-2.0 Windows client is read as a specification and **never** copied. Record derivations in
    [NOTICE](NOTICE).
@@ -130,8 +143,12 @@ git show --stat --name-only HEAD
 ## Layout
 
 - `App/app/dock.c`, `App/app/dock.h` — **ours**: the pure protocol core.
+- `App/app/dock_tx_interlock.h` — **ours**: the one predicate behind F9's transmit interlock, read
+  by the gate in `radio.c`, by the `0x087A` flag in `uart.c`, and by `tests/host/test_interlock.c`.
 - `App/app/uart.c` — upstream, plus our dispatch cases and `Dock_*` HAL glue.
-- `App/CMakeLists.txt`, `CMakePresets.json` — upstream, plus `ENABLE_DOCK`.
+- `App/radio.c` — upstream, plus **one** `else if` in `RADIO_PrepareTX` (F9; see guardrail 5).
+- `App/CMakeLists.txt`, `CMakePresets.json` — upstream, plus `ENABLE_DOCK` and
+  `ENABLE_DOCK_FM_TX_INTERLOCK`.
 - `tests/host/` — **ours**: the host harness.
 - `PROTOCOL.md`, `BENCH.md`, `NOTICE`, `adr/` — **ours**.
 - Everything else is F4HWN's. Leave it alone unless you are rebasing.

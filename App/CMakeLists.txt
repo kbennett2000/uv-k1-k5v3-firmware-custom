@@ -242,6 +242,14 @@ if(ENABLE_DOCK AND NOT ENABLE_UART)
     message(FATAL_ERROR "ENABLE_DOCK requires ENABLE_UART (the dock rides the UART command dispatch).")
 endif()
 
+# F9 — refuse to transmit while the BK1080 holds the speaker line (app/dock_tx_interlock.h).
+# Opt-IN, unlike upstream's ENABLE_TX_WHEN_AM which is opt-OUT: this is a fork addition
+# serving the dock, so the editions this fork does not ship keep F4HWN's own behaviour.
+enable_feature(ENABLE_DOCK_FM_TX_INTERLOCK)
+if(ENABLE_DOCK_FM_TX_INTERLOCK AND NOT ENABLE_FMRADIO)
+    message(FATAL_ERROR "ENABLE_DOCK_FM_TX_INTERLOCK requires ENABLE_FMRADIO (there is no second receiver to interlock against).")
+endif()
+
 # ---- COMPILER/LINKER OPTIONS ----
 
 enable_feature(ENABLE_SWD)

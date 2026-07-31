@@ -22,7 +22,8 @@
  * This module implements ONLY the wire surface radio-server drives:
  *   0x0850 write-registers, 0x0851 read-registers -> 0x0951 RegisterInfo,
  *   0x0870 enter / 0x0871 exit full-control,
- *   0x0873 set-VFO -> 0x0874 (F6), 0x0877 set-modulation -> 0x0878 (F7).
+ *   0x0873 set-VFO -> 0x0874 (F6), 0x0877 set-modulation -> 0x0878 (F7),
+ *   0x0879 set-broadcast-FM -> 0x087A (F8, the BK1080 second receiver).
  * No keypress-sim, screen, scan or GPIO commands. The register commands are how
  * radio-server drives the chip; 0x0873 and 0x0877 exist because register writes
  * do not survive the 0x0871 handoff (see the long note below).
@@ -383,6 +384,28 @@ typedef struct {
  * that broadcast FM disables TX, which is false and dangerous in the safe-looking
  * direction: this radio transmits perfectly well while deaf. */
 #define DOCK_FM_FLAG_TX_OK 0x01u
+
+/* Bit 1 (F9): broadcast FM is blocking transmit ON THIS BUILD, right now.
+ *
+ * READ THE TWO BITS TOGETHER:  will_key = (flags & TX_OK) && !(flags & FM_BLOCKS_TX)
+ *
+ * Bit 0 keeps its meaning exactly — the BK4819 demodulator — because two causes
+ * collapsed into one answer is a diagnosis a host cannot act on, and because it is
+ * already published and already implemented against. So the second cause gets the
+ * second bit, and all four combinations are real states of some image this fork ships.
+ *
+ * IT REPORTS BLOCKING, NOT READINESS, AND THAT POLARITY IS LOAD-BEARING. flags blanks
+ * to 0 on every refusal (below), and firmware older than F9 answers 0 because the bit
+ * did not exist. A readiness bit would read "will not key" in both cases and let an
+ * unmeasured field stop a transmitter; a blocking bit reads "not blocked" in both,
+ * which is TRUE of a refusal that measured nothing and TRUE of an F8 radio.
+ *
+ * IT IS ALSO A PROPERTY OF THE IMAGE, NOT ONLY OF THE RADIO. The interlock is behind
+ * ENABLE_DOCK_FM_TX_INTERLOCK, on in Fusion and off in the editions this fork does not
+ * ship. An image built without it answers 0 while playing broadcast FM, and that is
+ * correct: it will in fact key. See App/app/dock_tx_interlock.h, which is the one place
+ * that condition is written and is read by both the gate and this flag. */
+#define DOCK_FM_FLAG_FM_BLOCKS_TX 0x02u
 
 /* 0x087A status byte. THE NUMBERS ARE 0x0874's, holes and all, for the reason 0x0878
  * reuses them: one table decodes every command on this wire, and "status 4 means a

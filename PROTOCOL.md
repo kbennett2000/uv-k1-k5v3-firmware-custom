@@ -294,20 +294,37 @@ BK4819 register access and the BK1080's registers are not in that space.
 
 > ### Read this before you send it
 >
-> **Turning this on makes the radio deaf to its own channel, and does not stop it transmitting.**
+> **Turning this on makes the radio deaf to its own channel.**
 >
 > The BK1080 takes over the speaker line. If you are reading receive audio off that line — an AIOC
 > cable, say — you will hear broadcast FM and nothing else, including nothing of the channel the
-> radio is tuned to.
+> radio is tuned to. That is true on every build, and `action = 0` is what gives the radio its
+> ears back.
 >
-> The transmitter keeps working. This firmware's PTT path does not consult the broadcast-FM state at
-> all: the front-panel key filter whitelists PTT by name, and the FM screen's key handler jumps
-> straight to "start transmitting". So a station left in this mode **transmits normally into a
-> channel it cannot monitor** — including any automatic identification you send. Bit 0 of `flags`
-> reports whether the radio will key; it is about the *demodulator*, and it does **not** go false
-> because broadcast FM is on. Watch `state`, not `flags`, for this hazard.
+> **Whether it also stops transmitting depends on the image, so ask the radio rather than assuming.**
 >
-> Send `action = 0` to give the radio its ears back.
+> Through F8, it did not. The PTT path did not consult the broadcast-FM state at all — the
+> front-panel key filter whitelists PTT by name and the FM screen's key handler jumps straight to
+> "start transmitting" — so a station left in this mode **transmitted normally into a channel it
+> could not monitor**, including any automatic identification it sent.
+>
+> At F9 an interlock in `RADIO_PrepareTX` refuses that key. It is behind a build flag
+> (`ENABLE_DOCK_FM_TX_INTERLOCK`, on in `Fusion`), because it changes what the radio does with no
+> host involved and the editions this fork does not ship keep upstream's behaviour. It covers the
+> **PTT pin and the front panel** — which is where an AIOC cable keys, by driving that same pin. It
+> does **not** cover a host keying by writing `REG_30` over `0x0850`; that path never enters
+> `RADIO_PrepareTX` and still transmits while deaf.
+>
+> **So read both flag bits, and do not read either one alone:**
+>
+> ```
+> will_key = (flags & 0x01) && !(flags & 0x02)
+> ```
+>
+> Bit 0 is about the *demodulator* and never goes false because broadcast FM is on. Bit 1 is the
+> interlock, reporting what **this image** is actually doing right now — `0` on an F8 radio, `0` on
+> an image built without the flag, `1` on a Fusion F9 radio whose receiver is running. A host that
+> reads bit 0 alone gets exactly one of the four combinations wrong, and it is the dangerous one.
 
 ### Request — 6 bytes
 
@@ -347,7 +364,7 @@ give the station its ears back, and that direction always stays available.
 | 1 | u8 | `state` — `0` off, `1` on, or `0xFF` |
 | 2–5 | u32 LE | `freq_hz` — where the receiver **is**, in Hz, or `0` |
 | 6 | u8 | `band` — `0`–`3`, or `0xFF` |
-| 7 | u8 | `flags` — bit 0: the radio will key its own transmit path (see the warning above) |
+| 7 | u8 | `flags` — bit 0: the demodulator will key. bit 1 (F9): broadcast FM is blocking transmit on this image. See the warning above — **read both** |
 
 | `status` | Meaning |
 |---|---|
@@ -373,6 +390,21 @@ do without having to model them yourself.
 > `band` (87.5–108, the one most hosts want), so blanking either to `0` would answer a refusal with a
 > specific and possibly wrong claim. `0` is *not* a real reading of `freq_hz`, so it blanks to `0`
 > exactly as `0x0874`'s frequencies do.
+
+> **The two `flags` bits are independent, and all four combinations are real.** Bit 0 is the BK4819
+> demodulator; bit 1 is the BK1080 interlock. Nothing couples them.
+>
+> | bit 0 `TX_OK` | bit 1 `FM_BLOCKS_TX` | the radio | typical image |
+> |---|---|---|---|
+> | 1 | 0 | keys | any build, FM off — or any pre-F9/no-interlock build, FM on |
+> | 1 | **1** | **refuses** | Fusion F9, receiver running |
+> | 0 | 0 | refuses | on AM (see `0x0878`), receiver idle |
+> | 0 | 1 | refuses | on AM *and* deaf — two independent reasons, both reported |
+>
+> **Bit 1 blanks to `0` on a refusal, and that direction is deliberate.** A refused frame measured
+> nothing, so it must not be able to claim the radio is blocked — an unmeasured field must never
+> stop a transmitter. The same reasoning that makes `state` blank to `0xFF` rather than `0` makes
+> this blank to `0` rather than `1`.
 
 > **`status 8` exists because two different things can be keying.** The radio's own transmit state
 > covers the PTT pin and the front panel. It does **not** cover a host keying by writing `REG_30`
@@ -445,13 +477,30 @@ AB CD 0A 00 6F 64 12 E6 2F 91 B8 66 27 35 9A 85 DC BA
 ```
 deobfuscated payload: `79 08 06 00 01 00 B5 26 06 00`
 
-**its `0x087A` reply** — applied, playing, 103.2 MHz read back, band 0, `flags = 1` (**the radio is
-deaf to its own channel and will still key**):
+**its `0x087A` reply on a pre-F9 or no-interlock image** — applied, playing, 103.2 MHz read back,
+band 0, `flags = 1` (**the radio is deaf to its own channel and will still key**):
 
 ```
 AB CD 0C 00 6C 64 1C E6 2E 90 0D F5 07 33 D5 41 EC FC DC BA
 ```
 deobfuscated payload: `7A 08 08 00 00 01 00 B5 26 06 00 01`
+
+**the same reply from a Fusion F9 image** — identical except `flags = 3`, because the interlock is
+now refusing the key (**deaf, and the radio knows it**). One byte differs, at offset 15:
+
+```
+AB CD 0C 00 6C 64 1C E6 2E 90 0D F5 07 33 D5 43 EC FC DC BA
+```
+deobfuscated payload: `7A 08 08 00 00 01 00 B5 26 06 00 03`
+
+**`0x0879` request — broadcast FM OFF.** This is the frame a host sends to give a deaf station its
+ears back, and it is the only `0x0879` radio-server ever sends. `freq_hz` and `band` are ignored on
+this action and an off is never refused for them, so all-zero is a fine encoding of "just stop":
+
+```
+AB CD 0A 00 6F 64 12 E6 2E 91 0D 40 21 35 6E 13 DC BA
+```
+deobfuscated payload: `79 08 06 00 00 00 00 00 00 00`
 
 **`0x0879` with an empty payload** — the F8 probe:
 
@@ -518,8 +567,10 @@ tagged `radio-server-fN-v5.7.0`.
 | **F5** | engages the power amplifier on the key-up edge | keys cleanly, radiates nothing usable |
 | **F6** | `0x0873`/`0x0874` set-VFO | tuning does not survive `0x0871`; no power control |
 | **F7** | `0x0877`/`0x0878` set-modulation, and `0x0873` stops forcing FM | the radio is FM-only; there is no way to receive AM |
+| **F8** | `0x0879`/`0x087A` set-broadcast-FM — the BK1080 second receiver | no way to reach the second receiver, and no way to switch it off |
+| **F9** | refuses to transmit while broadcast FM is running, and reports it in `0x087A` `flags` bit 1 | the radio transmits into a channel it cannot hear, station ID included |
 
-**F7 is cumulative** — it contains F2, F3, F5 and F6. Flash that one.
+**F9 is cumulative** — it contains F2, F3, F5, F6, F7 and F8. Flash that one.
 
 ### Detecting the level from your own software
 
@@ -530,11 +581,19 @@ There is no version command (the plaintext HELLO is not answered here). So ask t
    **F6 or later**. Silence means older.
 3. Send a `0x0877` with an **empty** payload. A `0x0878` back — status `1`, `ERR_SHORT` — means
    **F7 or later**. Silence means F6 or older.
+4. Send a `0x0879` with an **empty** payload. A `0x087A` back — status `1`, `ERR_SHORT` — means
+   **F8 or later**. Silence means F7 or older. The vectors for both halves are published above.
 
-Steps 2 and 3 are safe by construction: the length check is the first branch of each command, so the
-firmware refuses before it decodes a field, before it calls its binding, and with every frequency (or
-modulation) in the reply blanked. They are questions, not commands. Any reply answers — `ERR_BUSY`
-proves the command exists just as well as `ERR_SHORT` does.
+Steps 2, 3 and 4 are safe by construction: the length check is the first branch of each command, so
+the firmware refuses before it decodes a field, before it calls its binding, and with every frequency
+(or modulation, or receiver state) in the reply blanked. They are questions, not commands. Any reply
+answers — `ERR_BUSY` proves the command exists just as well as `ERR_SHORT` does.
+
+**F9 is not detectable by probing, and deliberately so.** It adds no command; it adds a refusal and a
+flag bit. The bit is `0` on an F8 radio and `0` on an F9 image built without
+`ENABLE_DOCK_FM_TX_INTERLOCK`, which is the right answer in both cases — neither of those radios is
+blocking anything. If you need to know whether a key-up will succeed, do not infer a firmware level:
+send `0x0879` and read `flags` bit 1, which reports what the image in front of you is actually doing.
 
 ---
 
@@ -543,8 +602,9 @@ proves the command exists just as well as `ERR_SHORT` does.
 - **[`App/app/dock.c`](App/app/dock.c) / [`dock.h`](App/app/dock.h)** are pure C with **no firmware or
   hardware includes** — all hardware sits behind a caller-supplied `dock_hal_t`. You can compile them
   on a host and use them as a reference decoder directly.
-- **[`tests/host/test_dock.c`](tests/host/test_dock.c)** is 144 checks including the golden frames
-  above. `make -C tests/host run`. It needs nothing but a C compiler.
+- **[`tests/host/test_dock.c`](tests/host/test_dock.c)** is 155 checks including the golden frames
+  above, and **[`tests/host/test_interlock.c`](tests/host/test_interlock.c)** a further 6 across the
+  three build shapes F9's interlock can take. `make -C tests/host run`. Nothing but a C compiler.
 - **`radio_server/backends/uvk5/frames.py`** in
   [radio-server](https://github.com/kbennett2000/radio-server) is a complete, independently-written
   Python implementation of this protocol, with the register-level cookbook (frequency, bandwidth,
