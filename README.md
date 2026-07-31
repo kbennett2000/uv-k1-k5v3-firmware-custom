@@ -65,10 +65,18 @@ Each cycle unlocked something the one before it lacked. Releases are tagged `rad
 | **F5** | engages the power amplifier on the key-up edge | keys cleanly and **radiates nothing usable** |
 | **F6** | `0x0873`/`0x0874` set-VFO | tuning does not survive `0x0871`; no transmit-power control |
 | **F7** | `0x0877`/`0x0878` set-modulation; `0x0873` stops forcing FM | the radio is FM-only — there is no way to receive AM |
+| **F8** | `0x0879`/`0x087A` broadcast FM — reach and report the BK1080 second receiver | a host cannot tell that the radio's FM radio is holding the speaker, so the station is deaf on its own channel and nothing says so |
+| **F9** | refuses to key while broadcast FM is running, and reports it in `0x087A` flags bit 1 | the radio transmits normally while deaf — it cannot hear the channel it is transmitting on, station ID included |
 
-**[Flash F7](../../releases/tag/radio-server-f7-v5.7.0).** It is cumulative. F3 and F5 are the two
+**[Flash F9](../../releases/tag/radio-server-f9-v5.7.0).** It is cumulative. F3 and F5 are the two
 that cost a diagnostic cycle each to find, and neither is visible from the host as a fault — the radio
 reports success and does nothing. If you are debugging a silent radio, check the level first.
+
+> ⚠️ **F9 is not on `main` yet.** `main` is F8 (merge `d086a23`); F9 lives on branch
+> **`f9-fm-tx-interlock`** ([PR #7](../../pull/7)) and in the pre-release
+> **[`radio-server-f9-v5.7.0`](../../releases/tag/radio-server-f9-v5.7.0)**. **A build from `main`
+> has the broadcast-FM commands but not the transmit interlock, so it will key while the BK1080 is
+> playing** — flash the pre-release, or build from the branch, if you want the radio to stop itself.
 
 ## Build
 
