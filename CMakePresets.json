@@ -215,6 +215,7 @@
                 "ENABLE_FEAT_F4HWN_LOGO_SAV": true,
                 "ENABLE_SWD": true,
                 "ENABLE_DOCK": true,
+                "ENABLE_DOCK_FM_TX_INTERLOCK": true,
                 "EDITION_STRING": "Fusion",
                 "TARGET": "f4hwn.fusion"
             }

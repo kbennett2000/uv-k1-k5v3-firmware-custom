@@ -273,24 +273,38 @@ actually strong where the radio is). Expected: `0x087A` status `0`, `state = 1`,
 `⚠ CONFIRM AT BENCH`: whether broadcast FM audio over the AIOC needs any gain change relative to
 normal channel receive. Unknown. Do not guess a number here.
 
-### 9. The station is deaf while this is on, and still transmits  ⚠ CONFIRM AT BENCH
+### 9. The station is deaf while this is on — and at F9 it refuses to key  ⚠ CONFIRM AT BENCH
 
-**Read from the source, not observed**, and it is the reason ADR 0156 is named what it is. Nothing in
-`RADIO_PrepareTX` consults `gFmRadioMode`; the key filter whitelists `KEY_PTT`; `GENERIC_Key_PTT`
-jumps to `start_tx` on the FM screen.
+**THIS SECTION'S EXPECTATIONS CHANGED AT F9. Check which image is flashed before running it.**
+Through F8 the radio transmitted while deaf; F9 adds an interlock in `RADIO_PrepareTX` that refuses.
+Everything here is still **read from the source, not observed**.
 
 With a **dummy load**:
 
-1. Turn broadcast FM on over `0x0879`. Confirm `state = 1` **and** `flags` bit 0 = 1.
+1. Turn broadcast FM on over `0x0879`. Confirm `state = 1`.
 2. Confirm the radio hears nothing of its own channel — key a second radio on the tuned channel and
-   confirm no channel audio reaches the AIOC.
-3. Press the radio's own PTT. Expected: **it transmits.** Confirm it does.
-4. Assert the AIOC's DTR line. Expected: **also transmits.**
-5. Confirm the broadcast audio returns by itself a few seconds after the over ends — the firmware's
-   own `gFM_RestoreCountdown_10ms` path.
+   confirm no channel audio reaches the AIOC. **This is unchanged by F9**: the interlock stops the
+   transmitter, it does not give the speaker back. Only `action = 0` does that.
+3. Press the radio's own PTT.
+   - On **F8 or earlier**, or any image built without `ENABLE_DOCK_FM_TX_INTERLOCK`: it transmits.
+   - On a **Fusion F9** image: expected **refusal** — no carrier, and the firmware's
+     double-beep (`BEEP_500HZ_60MS_DOUBLE_BEEP_OPTIONAL`), the same one an AM key-up gives.
+4. Assert the AIOC's DTR line. Expected: **the same answer as step 3**, because the DTR line drives
+   `GPIO_PIN_PTT` — the identical pin the rubber button drives — and there is no separate
+   external-PTT path in this firmware.
+5. Send `action = 0`, then repeat step 3. Expected on F9: **it transmits again immediately**, with no
+   restart and no power cycle. The interlock reads live state and does not latch.
+6. Confirm the broadcast audio returns by itself a few seconds after an over ends — the firmware's
+   own `gFM_RestoreCountdown_10ms` path. On F9 this only applies to an over that was *allowed*.
 
 `⚠ CONFIRM AT BENCH`: whether an over taken while broadcast FM is on sounds normal at the far end.
-The firmware powers the BK1080 down on key-up, so it should, but that is inference.
+The firmware powers the BK1080 down on key-up, so it should, but that is inference. (Only reachable
+on a pre-F9 or no-interlock image, or on F9 with broadcast FM off.)
+
+`⚠ CONFIRM AT BENCH` (**new at F9**): that the interlock actually refuses on hardware — steps 3, 4
+and 5 above — and that `0x087A` `flags` bit 1 reads `1` while it is refusing and `0` once broadcast
+FM is off. Every claim in this section is read from the source; **nothing has been flashed**, and
+guardrail 1 forbids filling this in from inference.
 
 ### 10. Refusal while keyed, and the flash behaviour  ⚠ CONFIRM AT BENCH
 

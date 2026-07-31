@@ -1,1 +1,4 @@
 test_dock
+test_interlock_fusion
+test_interlock_broadcast
+test_interlock_nofm

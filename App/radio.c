@@ -18,6 +18,9 @@
 #include <string.h>
 
 #include "am_fix.h"
+// A dock_-prefixed header in an upstream file is deliberate: it announces at the point
+// of use that the clause it feeds in RADIO_PrepareTX is this fork's addition, not F4HWN's.
+#include "app/dock_tx_interlock.h"
 #include "app/dtmf.h"
 #ifdef ENABLE_FEAT_F4HWN_RXTX_LOG
     #include "app/rxtx_log.h"
@@ -1241,6 +1244,24 @@ void RADIO_PrepareTX(void)
         State = VFO_STATE_TX_DISABLE;
     }
 #endif
+    // F9 — do not transmit into a channel this station cannot hear. While the BK1080 is
+    // running it holds the speaker line, so the radio hears broadcast FM and NOTHING of
+    // its own channel; stock firmware transmits anyway, automatic station ID included.
+    //
+    // THE OPPOSITE POLARITY TO THE ENABLE_TX_WHEN_AM CLAUSE ABOVE IS DELIBERATE — do not
+    // "fix" it. That one is upstream behaviour behind an upstream flag, so it is active
+    // unless a builder opts out. This is a fork addition serving the dock, so it is
+    // inactive unless a builder opts in, and the ENABLE_DOCK_ prefix says which is which.
+    // It is on in Fusion, the preset radio-server stations flash, and off in the F4HWN
+    // editions this fork does not ship — whose users have no dock, no host, and a good
+    // reason to keep keying while they listen to the radio.
+    //
+    // The condition is NOT written here: it is Dock_BroadcastFmBlocksTx() in
+    // App/app/dock_tx_interlock.h, so that the 0x087A flag reporting this refusal to a
+    // host reads the same predicate the refusal does and cannot drift from it.
+    else if (Dock_BroadcastFmBlocksTx()) {
+        State = VFO_STATE_TX_DISABLE;
+    }
 
     if (State != VFO_STATE_NORMAL) {
         // TX not allowed

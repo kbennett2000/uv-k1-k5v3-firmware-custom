@@ -172,7 +172,9 @@ static void hal_set_fm(void *u, const dock_fm_t *fm, dock_fm_applied_t *out)
         out->state   = DOCK_FM_STATE_OFF;
         out->freq_hz = 103200000u;
         out->band    = 0u;
-        out->flags   = DOCK_FM_FLAG_TX_OK;
+        /* BOTH flag bits set, so the blanking test can prove dock.c clears the whole
+         * byte rather than the one bit that existed when it was written. */
+        out->flags   = DOCK_FM_FLAG_TX_OK | DOCK_FM_FLAG_FM_BLOCKS_TX;
         return;
     }
 
@@ -1323,6 +1325,118 @@ int main(void)
     flen = build_cmd(frame, 0x087Bu, params, plen);
     feed(frame, flen);
     CHECK(g_caplen == 0, "0x087B: unknown opcode beside 0x0879 is still answered with silence");
+
+    /* =====================================================================
+     * F9 — the radio refuses to transmit while deaf (0x087A flags bit 1)
+     *
+     * The interlock itself lives in RADIO_PrepareTX and its predicate in
+     * dock_tx_interlock.h; neither is reachable from here, and the predicate has its
+     * own three-way-compiled test (tests/host/test_interlock.c). What THESE cases pin
+     * is the wire: that dock.c carries the second bit, blanks it with the rest, and
+     * keeps it independent of bit 0 — the property a host's will_key rule depends on.
+     * ===================================================================== */
+
+    /* 57. Bit 1 is carried on an applied reply. This is an interlocked image reporting
+     *     a running BK1080: the station is deaf AND the radio will now refuse its own
+     *     PTT, which is the state F9 exists to create and to publish. */
+    reset();
+    g_fm_flags = DOCK_FM_FLAG_TX_OK | DOCK_FM_FLAG_FM_BLOCKS_TX;
+    plen = p_fm(params, DOCK_FM_ON, HZ_1032, 0u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    CHECK(last_fm_reply(&frep) && frep.state == DOCK_FM_STATE_ON
+          && (frep.flags & DOCK_FM_FLAG_FM_BLOCKS_TX) != 0,
+          "0x087A: a build whose interlock is refusing says so on the wire");
+
+    /* 58. The two bits are INDEPENDENT, and all four combinations are real states of
+     *     some image the fork publishes. This is the case that matters most to a host,
+     *     because the naive read — "bit 0 says it will key" — is wrong on exactly one
+     *     of them. The rule is will_key = TX_OK && !FM_BLOCKS_TX.
+     *
+     *     TX_OK=1 BLOCKS=0  FM demodulator, no interlock or no broadcast FM -> keys
+     *     TX_OK=1 BLOCKS=1  FM demodulator, interlocked image, receiver running -> REFUSES
+     *     TX_OK=0 BLOCKS=0  the radio is on AM (F7's refusal), receiver idle -> refuses
+     *     TX_OK=0 BLOCKS=1  on AM *and* deaf: two independent reasons, both reported */
+    {
+        static const uint8_t combos[4] = {
+            DOCK_FM_FLAG_TX_OK,
+            DOCK_FM_FLAG_TX_OK | DOCK_FM_FLAG_FM_BLOCKS_TX,
+            0u,
+            DOCK_FM_FLAG_FM_BLOCKS_TX,
+        };
+        for (unsigned i = 0; i < 4; i++) {
+            reset();
+            g_fm_flags = combos[i];
+            plen = p_fm(params, DOCK_FM_ON, HZ_1032, 0u);
+            flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+            feed(frame, flen);
+            CHECK(last_fm_reply(&frep) && frep.flags == combos[i],
+                  "0x087A: every TX_OK/FM_BLOCKS_TX combination survives the wire intact");
+        }
+    }
+
+    /* 59. Bit 1 blanks with everything else on a refusal — and note WHICH WAY that
+     *     fails. flags blanks to 0, so a refused frame reports NOT-blocked. That is
+     *     deliberate and it matches the sentinel rule above rather than fighting it: a
+     *     refusal measured nothing, and an unmeasured field must never lock a
+     *     transmitter. Reporting "blocked" here would let a lost frame stop a station.
+     *     (Same rule radio-server ADR 0158 pinned in both directions for tx_ok.) */
+    reset();
+    g_fm_force_status = DOCK_FM_ERR_BAND;         /* the HAL sets BOTH bits; see hal_set_fm */
+    plen = p_fm(params, DOCK_FM_ON, HZ_1032, 0u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    CHECK(last_fm_reply(&frep) && frep.status == DOCK_FM_ERR_BAND && frep.flags == 0u,
+          "0x087A: a refusal blanks BOTH flag bits, and blanks toward 'not blocked'");
+
+    /* 60. Byte-exact F9 reply vector, flags = 0x03. Derived from the same independent
+     *     reference framer as F8's, which was re-run this cycle and reproduced BOTH
+     *     published 0x087A vectors and the published 0x0879 command byte-for-byte
+     *     before this new output was trusted. It differs from F8's published ON vector
+     *     at exactly one byte — offset 15, the obfuscated flags byte. */
+    reset();
+    g_fm_flags = DOCK_FM_FLAG_TX_OK | DOCK_FM_FLAG_FM_BLOCKS_TX;
+    plen = p_fm(params, DOCK_FM_ON, HZ_1032, 0u);
+    flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+    feed(frame, flen);
+    {
+        static const uint8_t golden[] = {
+            0xAB, 0xCD, 0x0C, 0x00,
+            0x6C, 0x64, 0x1C, 0xE6, 0x2E, 0x90, 0x0D, 0xF5, 0x07, 0x33, 0xD5, 0x43,
+            0xEC, 0xFC,
+            0xDC, 0xBA,
+        };
+        CHECK(g_caplen == sizeof(golden), "0x087A: F9 golden reply length");
+        CHECK(g_caplen == sizeof(golden) &&
+              memcmp(g_cap, golden, sizeof(golden)) == 0,
+              "0x087A: byte-exact F9 reply vector (flags = TX_OK | FM_BLOCKS_TX)");
+    }
+
+    /* 61. The 0x0879 OFF command, byte-exact — and this one is overdue rather than new.
+     *     PROTOCOL.md published four 0x0879/0x087A vectors at F8 and NONE of them was
+     *     the frame radio-server actually sends, which makes the spec misleading rather
+     *     than merely incomplete: an implementer working from it has no pinned example
+     *     of the only direction that gives a deaf station its ears back. Derived from
+     *     the reference framer AND cross-checked against radio-server's own
+     *     ClearBroadcastFm().to_frame(), which agree byte-for-byte.
+     *     (radio-server ADR 0158 R6.) */
+    reset();
+    {
+        static const uint8_t golden[] = {
+            0xAB, 0xCD, 0x0A, 0x00,
+            0x6F, 0x64, 0x12, 0xE6, 0x2E, 0x91, 0x0D, 0x40, 0x21, 0x35, 0x6E, 0x13,
+            0xDC, 0xBA,
+        };
+        plen = p_fm(params, DOCK_FM_OFF, 0u, 0u);
+        flen = build_cmd(frame, DOCK_CMD_SET_FM, params, plen);
+        CHECK(flen == sizeof(golden), "0x0879: OFF golden command length");
+        CHECK(flen == sizeof(golden) && memcmp(frame, golden, sizeof(golden)) == 0,
+              "0x0879: byte-exact OFF command vector — the frame the host actually sends");
+    }
+    feed(frame, flen);
+    CHECK(last_fm_reply(&frep) && frep.status == DOCK_FM_APPLIED
+          && frep.state == DOCK_FM_STATE_OFF,
+          "0x087A: and that frame is the one that turns the receiver off");
 
     /* ---- report ---- */
     printf("dock host tests: %d checks, %d failures\n", g_checks, g_fail);
