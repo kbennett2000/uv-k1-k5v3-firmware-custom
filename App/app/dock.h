@@ -69,9 +69,20 @@
  * already spoken for. That one is shipped and cannot be walked back. This one is
  * cheap to place correctly, so it is placed correctly. */
 #define DOCK_CMD_SET_MODULATION 0x0877u
+/* 0x0879, and the census was run again rather than assumed to have stayed true.
+ * Three sources, none of which agrees with the others and nothing reconciles them:
+ * radio-server ADR 0111:52-53 (the classic Dock's extras), ADR 0119:43-46 (what this
+ * fork ported and what it dropped), and radio-server frames.py's DockCommand enum.
+ * Union of everything any of them claims: 0x0514, 0x0801, 0x0803, 0x0808, 0x0809,
+ * 0x0850, 0x0851, 0x0860, 0x0861, 0x0870, 0x0871, 0x0872, 0x0873/4, 0x0875/6,
+ * 0x0877/8, 0x0888, and the replies 0x0515, 0x0908, 0x0951, 0x0961, 0x0988.
+ * 0x0879/0x087A appear in none of them. 0x0875/6 stay skipped for the reason above:
+ * claimed, unverifiable from either tree, therefore not free. */
+#define DOCK_CMD_SET_FM         0x0879u
 #define DOCK_REPLY_REG_INFO     0x0951u
 #define DOCK_REPLY_SET_VFO      0x0874u
 #define DOCK_REPLY_SET_MOD      0x0878u
+#define DOCK_REPLY_SET_FM       0x087Au
 
 /* Payload cap: matches radio_server frames.py MAX_PAYLOAD_SIZE (254). */
 #define DOCK_MAX_PAYLOAD 254u
@@ -265,6 +276,158 @@ typedef struct {
     uint8_t flags;       /* DOCK_MOD_FLAG_* */
 } dock_mod_applied_t;
 
+/* ---- 0x0879 set-FM (the BK1080), and its 0x087A reply --------------------
+ *
+ * A DIFFERENT CHIP. Everything else in this protocol drives the BK4819. The radio
+ * carries a SECOND receiver — a BK1080 broadcast-FM chip on the same I2C bus, sharing
+ * the antenna front end and the audio amplifier and nothing else. 0x0850/0x0851 cannot
+ * reach it: those are BK4819 register access and the BK1080's registers are not in that
+ * address space. Which is why this is an opcode and not a register recipe.
+ *
+ * WHAT THIS COSTS THE STATION, WHICH IS THE WHOLE REASON THE REPLY IS SHAPED AS IT IS.
+ *
+ * Turning this on puts the BK1080 on the speaker line — the line an AIOC cable listens
+ * on. The station stops hearing its own channel. It does NOT stop transmitting:
+ * gFmRadioMode is not consulted by RADIO_PrepareTX, app/main.c's key filter whitelists
+ * KEY_PTT, and app/generic.c jumps straight to start_tx when the FM screen is up. So a
+ * host that leaves this on has a station that transmits into a channel it cannot hear,
+ * including its automatic station ID. `state` in the reply is what tells a host that,
+ * and it is why `state` is reported on every reply rather than only on request.
+ *
+ * WHY THE WIRE CARRIES Hz AND THE CHIP DOES NOT.
+ *
+ * The BK1080 tunes on a 100 kHz raster: driver/bk1080.c computes a "channel" as the
+ * frequency minus the band's low limit, in units of 100 kHz, and gEeprom.FM_FrequencyPlaying
+ * is a uint16 on that scale (1032 = 103.2 MHz). The wire carries plain Hz anyway, as
+ * 0x0873 does, and the firmware converts.
+ *
+ * But it converts by REFUSING, not by rounding. 0x0873 silently truncates sub-10 Hz
+ * detail because 10 Hz of a repeater channel is nothing; 100 kHz of the broadcast band
+ * is a WHOLE ADJACENT STATION. So anything not on the raster comes back
+ * DOCK_FM_ERR_FIELD, exactly as 0x0877 refuses an unaccepted modulation and 0x0873
+ * refuses an out-of-range field. Silent substitution of a nearby value for the one that
+ * was asked for is the fault class this protocol keeps paying to remove; it is not
+ * introduced here for the sake of two bytes.
+ *
+ * The reply reports the frequency the radio is ACTUALLY on, in the same Hz, read back
+ * from the firmware's own state after applying — so the raster behaviour is visible to
+ * a host that never opens PROTOCOL.md.
+ *
+ * THE BAND IS A NUMBER, AND THE FIRMWARE'S FIELD FOR IT IS TWO BITS WIDE.
+ *
+ * gEeprom.FM_Band is declared `uint8_t FM_Band : 2` (settings.h). Assigning 4 to it
+ * yields 0 — a clamp performed by the assignment operator itself, with no diagnostic
+ * anywhere, leaving the radio on 87.5-108 while the host believes it asked for something
+ * else. So the band number is range-checked HERE, on the wire's own scale, before any
+ * binding sees it. Guardrail 2: validate before acting, refuse rather than clamp.
+ *
+ * The band's frequency LIMITS are not checked here. They live in the BK1080 driver
+ * (BK1080_GetFreqLoLimit/HiLimit), and a second copy of a hardware table in this file
+ * is a drift hazard worth more than the testability it would buy. So the band NUMBER is
+ * a dock.c verdict (DOCK_FM_ERR_FIELD) and the band LIMITS are a HAL verdict
+ * (DOCK_FM_ERR_BAND) — the same split 0x0873 already draws between its field checks and
+ * its Dock_FreqInBand check.
+ *
+ * A frequency below the band's low limit is not merely wrong, it UNDERFLOWS: the
+ * driver's `channel = frequency - loLimit` is uint16 arithmetic with no guard. Refusing
+ * out-of-band is a safety requirement here, not only doctrine.
+ */
+#define DOCK_SET_FM_PARAM_LEN 6u
+
+/* The BK1080's channel raster. A frequency that is not a multiple of this is refused
+ * (DOCK_FM_ERR_FIELD), never rounded — see the note above. */
+#define DOCK_FM_RASTER_HZ 100000u
+
+/* Request actions. TUNE is not a cheaper spelling of ON: ON brings the chip up and
+ * takes the speaker, TUNE only moves an already-running receiver. A host stepping
+ * across the band must never be able to switch the station deaf by accident, so TUNE
+ * on a radio that is off is refused (DOCK_FM_ERR_OFF) rather than promoted to an ON. */
+#define DOCK_FM_OFF  0u
+#define DOCK_FM_ON   1u
+#define DOCK_FM_TUNE 2u
+#define DOCK_FM_ACTION_MAX DOCK_FM_TUNE
+
+/* Band numbers, as the BK1080 driver's limit tables define them:
+ *   0 = 87.5-108.0, 1 = 76.0-108.0, 2 = 76.0-90.0, 3 = 64.0-76.0 (MHz). */
+#define DOCK_FM_BAND_MAX 3u
+
+/* Reply `state`: what the BK1080 is doing now, read back from gFmRadioMode. */
+#define DOCK_FM_STATE_OFF 0u
+#define DOCK_FM_STATE_ON  1u
+
+/* Reply sentinels for a refusal. THREE FIELDS, AND THEY DO NOT ALL BLANK TO THE SAME
+ * VALUE, because the rule is "a value that cannot be a real reading of THIS field" and
+ * the fields disagree about which values are real:
+ *
+ *   state  0 IS REAL (OFF)      -> 0xFF. Blanking to 0 would answer a refusal with
+ *                                  "the receiver is idle" — a specific, checkable,
+ *                                  possibly-wrong claim. The 0x0878 lesson exactly.
+ *   band   0 IS REAL (87.5-108) -> 0xFF. Same reason, and worse: 0 is the band nearly
+ *                                  every host actually wants.
+ *   freq   0 is NOT REAL (no    -> 0. Matches 0x0874, which zeroes its frequencies on
+ *          band's low limit is     a refusal for the identical reason.
+ *          anywhere near 0)
+ *   flags  0 means "no flags"   -> 0, matching 0x0878.
+ *
+ * Enforced in dock.c on every non-APPLIED path, never left to the HAL (guardrail 3). */
+#define DOCK_FM_STATE_UNKNOWN 0xFFu
+#define DOCK_FM_BAND_UNKNOWN  0xFFu
+
+/* 0x087A flags. Bit 0 is 0x0878's DOCK_MOD_FLAG_TX_OK, same bit, same meaning: the
+ * radio will key its OWN transmit path.
+ *
+ * It is reported here even though broadcast FM does not change it — and saying so is
+ * the point. It is fed by the BK4819 demodulator (RADIO_PrepareTX refuses anything but
+ * MODULATION_FM on a build without ENABLE_TX_WHEN_AM), which is ORTHOGONAL to whether
+ * the BK1080 is running. A host holding only this reply would otherwise have to infer
+ * that broadcast FM disables TX, which is false and dangerous in the safe-looking
+ * direction: this radio transmits perfectly well while deaf. */
+#define DOCK_FM_FLAG_TX_OK 0x01u
+
+/* 0x087A status byte. THE NUMBERS ARE 0x0874's, holes and all, for the reason 0x0878
+ * reuses them: one table decodes every command on this wire, and "status 4 means a
+ * field was off its scale" stays true whichever opcode produced it. 3 (DIRECTION) and
+ * 7 (TONE) cannot arise here and are left unused rather than renumbered.
+ *
+ * 8 and 9 are NEW to the shared table and belong to it, not to this opcode — the same
+ * way 6 and 7 were 0x0873's alone and are still in the shared table. A host decoding a
+ * 0x0874 or a 0x0878 can never see them, because neither command can produce them. */
+#define DOCK_FM_APPLIED     0u  /* the receiver is in the state that was asked for  */
+#define DOCK_FM_ERR_SHORT   1u  /* payload shorter than the parameter set           */
+#define DOCK_FM_ERR_BUSY    2u  /* host holds full-control (0x0870)                 */
+#define DOCK_FM_ERR_FIELD   4u  /* unknown action, band > 3, or a frequency off the
+                                 * 100 kHz raster — refused, never rounded          */
+#define DOCK_FM_ERR_NO_HAL  5u  /* built without the radio-side binding             */
+#define DOCK_FM_ERR_BAND    6u  /* frequency outside the named band's own limits    */
+#define DOCK_FM_ERR_TX      8u  /* the radio is transmitting or monitoring; taking
+                                 * the speaker and the LNA mid-over is not a thing
+                                 * to do, and the state would not survive it anyway */
+#define DOCK_FM_ERR_OFF     9u  /* TUNE with the receiver off — see DOCK_FM_TUNE    */
+
+/* What the receiver ended up doing, read back from the firmware's own state AFTER
+ * applying — never the values that were handed in. That is 0x0874's doctrine and the
+ * reason it exists: when the wire's scale and the radio's disagree, echoing the request
+ * is exactly what hides it. Here the disagreement is the 100 kHz raster and a two-bit
+ * band field, and both are visible in this struct or nowhere.
+ *
+ * On any rejection: state and band are DOCK_FM_*_UNKNOWN, freq_hz is 0, flags is 0. */
+typedef struct {
+    uint32_t freq_hz;    /* Hz, as the radio is tuned — NOT the 100 kHz raster value */
+    uint8_t  status;     /* DOCK_FM_* */
+    uint8_t  state;      /* DOCK_FM_STATE_*, or DOCK_FM_STATE_UNKNOWN */
+    uint8_t  band;       /* 0..3, or DOCK_FM_BAND_UNKNOWN */
+    uint8_t  flags;      /* DOCK_FM_FLAG_* */
+} dock_fm_applied_t;
+
+/* One broadcast-FM request, decoded. Every member is off the wire — unlike dock_vfo_t,
+ * nothing here is carried from session state, because there is no sticky value to
+ * carry: the receiver's own on/off IS the state, and it is readable. */
+typedef struct {
+    uint32_t freq_hz;    /* Hz, as sent */
+    uint8_t  action;     /* DOCK_FM_OFF / ON / TUNE */
+    uint8_t  band;       /* 0..3, range-checked by dock.c before the HAL sees it */
+} dock_fm_t;
+
 /* One repeater channel to apply.
  *
  * NOT a straight decode of the wire: `modulation` is carried from the session's
@@ -320,6 +483,18 @@ typedef struct {
      * read back out of its own VFO — not the value it was handed. It reports what
      * happened; it does not re-validate what dock.c already checked. */
     void     (*set_modulation)(void *user, uint8_t wire_mod, dock_mod_applied_t *out);
+    /* Optional (may be NULL — then 0x0879 answers DOCK_FM_ERR_NO_HAL). Called on a
+     * validated 0x0879 whose action and band NUMBER dock.c has already range-checked.
+     * Never called while full_control is set, nor while the dock holds the key.
+     *
+     * MUST fill `out`: DOCK_FM_APPLIED plus what the receiver is NOW doing, read back
+     * out of the firmware's own state — not the values it was handed. It may also
+     * return DOCK_FM_ERR_BAND (the frequency is outside the band's own limits, which
+     * only the BK1080 driver's tables know) or DOCK_FM_ERR_TX / DOCK_FM_ERR_OFF, the
+     * two conditions dock.c cannot see from here: the radio's own FUNCTION_TRANSMIT /
+     * FUNCTION_MONITOR state, and whether the receiver was already running. It reports
+     * what happened; it does not re-validate what dock.c already checked. */
+    void     (*set_fm)(void *user, const dock_fm_t *fm, dock_fm_applied_t *out);
 } dock_hal_t;
 
 typedef struct {
@@ -358,6 +533,9 @@ void dock_send_set_vfo_reply(dock_ctx_t *ctx, const dock_vfo_applied_t *r);
 
 /* Build and send the 0x0878 set-modulation reply. Exposed for the harness. */
 void dock_send_set_mod_reply(dock_ctx_t *ctx, const dock_mod_applied_t *r);
+
+/* Build and send the 0x087A set-FM reply. Exposed for the harness. */
+void dock_send_set_fm_reply(dock_ctx_t *ctx, const dock_fm_applied_t *r);
 
 /* Framing primitives (exposed for the harness). CRC-16/XMODEM. */
 uint16_t dock_crc16(const uint8_t *data, uint16_t len);

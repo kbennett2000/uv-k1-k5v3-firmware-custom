@@ -154,6 +154,21 @@ void dock_send_set_mod_reply(dock_ctx_t *ctx, const dock_mod_applied_t *r)
     dock_send_payload(ctx, DOCK_REPLY_SET_MOD, p, sizeof(p));
 }
 
+void dock_send_set_fm_reply(dock_ctx_t *ctx, const dock_fm_applied_t *r)
+{
+    /* payload = [0x087A][param_len=8][status:u8][state:u8][freq_hz:u32][band:u8]
+     * [flags:u8]. Eight bytes, against DOCK_REPLY_MAX_PARAMS' twelve — the check that
+     * matters, because dock_send_payload sends NOTHING at all for a longer block and
+     * that is indistinguishable from a firmware without the command. */
+    const uint8_t p[8] = {
+        r->status, r->state,
+        (uint8_t)(r->freq_hz),       (uint8_t)(r->freq_hz >> 8),
+        (uint8_t)(r->freq_hz >> 16), (uint8_t)(r->freq_hz >> 24),
+        r->band, r->flags,
+    };
+    dock_send_payload(ctx, DOCK_REPLY_SET_FM, p, sizeof(p));
+}
+
 /* Little-endian u32 off the wire. Byte-at-a-time rather than a cast, because
  * the payload sits at an arbitrary offset in the RX buffer and this core is
  * compiled for both an ARM target and the host harness. */
@@ -276,6 +291,78 @@ void dock_dispatch(dock_ctx_t *ctx, const uint8_t *payload, uint16_t size)
             res.flags      = 0;
         }
         dock_send_set_mod_reply(ctx, &res);
+        break;
+    }
+
+    case DOCK_CMD_SET_FM: {
+        /* Same contract as 0x0873 and 0x0877: EVERY path answers, and the length check
+         * is the FIRST branch, so an empty 0x0879 is a safe firmware-level probe. It
+         * matters more here than it does there — the thing this command can do by
+         * accident is take the speaker away from a station that is still transmitting. */
+        dock_fm_applied_t res;
+        memset(&res, 0, sizeof(res));
+
+        if (plen < DOCK_SET_FM_PARAM_LEN) {
+            res.status = DOCK_FM_ERR_SHORT;         /* never read past the payload */
+        } else if (ctx->full_control) {
+            res.status = DOCK_FM_ERR_BUSY;          /* the host owns the chip */
+        } else if (ctx->tx_on) {
+            /* The dock is keying via REG_30. This is a DIFFERENT refusal from BUSY and
+             * gets its own status: BUSY already means "you hold full-control", and one
+             * code meaning two conditions is what makes a status table useless.
+             *
+             * It is also the half of the guard the radio cannot provide. The firmware's
+             * own ACTION_FM tests gCurrentFunction, and Dock_ForceTx never enters
+             * FUNCTION_Select — so mid-dock-over the radio believes it is idle. Only
+             * this flag knows, and it lives here, which is why this refusal is the one
+             * a host test can actually prove. */
+            res.status = DOCK_FM_ERR_TX;
+        } else {
+            dock_fm_t fm;
+            fm.action  = params[0];
+            fm.freq_hz = rd32(params + 1);
+            fm.band    = params[5];
+
+            if (fm.action > DOCK_FM_ACTION_MAX) {
+                res.status = DOCK_FM_ERR_FIELD;
+            } else if (fm.action == DOCK_FM_OFF) {
+                /* OFF ignores the frequency and band fields, and is deliberately NOT
+                 * refused on either. Turning the receiver off is how a host gives the
+                 * station its ears back, and it must never be blocked by a stale value
+                 * in a field this action does not use. Same instinct as ADR 0151 one
+                 * repository over: the direction that restores the radio is the one
+                 * that must always be available. */
+                if (!ctx->hal->set_fm)
+                    res.status = DOCK_FM_ERR_NO_HAL;
+                else
+                    ctx->hal->set_fm(ctx->hal->user, &fm, &res);
+            } else if (fm.band > DOCK_FM_BAND_MAX) {
+                /* Refuse, never clamp — and here the clamp would be invisible: the
+                 * firmware's FM_Band is a two-bit field, so band 4 becomes band 0
+                 * inside the assignment itself, with no diagnostic anywhere. */
+                res.status = DOCK_FM_ERR_FIELD;
+            } else if ((fm.freq_hz % DOCK_FM_RASTER_HZ) != 0u) {
+                /* Refuse, never round. The next raster step is a different station. */
+                res.status = DOCK_FM_ERR_FIELD;
+            } else if (!ctx->hal->set_fm) {
+                res.status = DOCK_FM_ERR_NO_HAL;
+            } else {
+                ctx->hal->set_fm(ctx->hal->user, &fm, &res);
+            }
+        }
+
+        /* The unconditional blanking contract, with a sentinel chosen per field rather
+         * than one copied across all of them: 0 is a REAL reading of both `state` (OFF)
+         * and `band` (87.5-108), so blanking either to 0 would answer a refusal with a
+         * specific and possibly wrong claim — 0x0878's lesson. 0 is not a real reading
+         * of `freq_hz`, so it blanks to 0 as 0x0874's frequencies do. */
+        if (res.status != DOCK_FM_APPLIED) {
+            res.state   = DOCK_FM_STATE_UNKNOWN;
+            res.band    = DOCK_FM_BAND_UNKNOWN;
+            res.freq_hz = 0u;
+            res.flags   = 0u;
+        }
+        dock_send_set_fm_reply(ctx, &res);
         break;
     }
 

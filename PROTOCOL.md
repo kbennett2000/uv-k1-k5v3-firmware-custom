@@ -75,9 +75,11 @@ make it fit.
 | `0x0871` | exit full control | **none** | — |
 | `0x0873` | set VFO | `0x0874`, **always** | 13 bytes, below |
 | `0x0877` | set modulation | `0x0878`, **always** | 1 byte, below |
+| `0x0879` | set broadcast FM | `0x087A`, **always** | 6 bytes, below |
 | `0x0951` | register info *(reply)* | — | `[reg:u16][value:u16]` |
 | `0x0874` | set-VFO result *(reply)* | — | 12 bytes, below |
 | `0x0878` | set-modulation result *(reply)* | — | 4 bytes, below |
+| `0x087A` | set-FM result *(reply)* | — | 8 bytes, below |
 
 An unknown opcode is dropped in silence. That is the only way to detect firmware level from the
 outside: send `0x0873` or `0x0877` and see whether anything comes back.
@@ -283,6 +285,105 @@ scales disagree, only the raw value makes it visible. Its numbering shifts with
 
 ---
 
+## `0x0879` set broadcast FM — a second receiver (F8)
+
+This one drives a **different chip**. Everything above talks to the BK4819. The radio also carries a
+**BK1080**, a commercial-FM receiver covering 64–108 MHz, on the same I²C bus, sharing the antenna
+front end and the audio amplifier and nothing else. `0x0850`/`0x0851` cannot reach it — those are
+BK4819 register access and the BK1080's registers are not in that space.
+
+> ### Read this before you send it
+>
+> **Turning this on makes the radio deaf to its own channel, and does not stop it transmitting.**
+>
+> The BK1080 takes over the speaker line. If you are reading receive audio off that line — an AIOC
+> cable, say — you will hear broadcast FM and nothing else, including nothing of the channel the
+> radio is tuned to.
+>
+> The transmitter keeps working. This firmware's PTT path does not consult the broadcast-FM state at
+> all: the front-panel key filter whitelists PTT by name, and the FM screen's key handler jumps
+> straight to "start transmitting". So a station left in this mode **transmits normally into a
+> channel it cannot monitor** — including any automatic identification you send. Bit 0 of `flags`
+> reports whether the radio will key; it is about the *demodulator*, and it does **not** go false
+> because broadcast FM is on. Watch `state`, not `flags`, for this hazard.
+>
+> Send `action = 0` to give the radio its ears back.
+
+### Request — 6 bytes
+
+| Offset | Type | Field | Notes |
+|---|---|---|---|
+| 0 | u8 | `action` | `0` off, `1` on (and tune), `2` tune only. Anything above `2` is refused |
+| 1–4 | u32 LE | `freq_hz` | Hz. **Must be a multiple of 100 000** — see below. Ignored when `action = 0` |
+| 5 | u8 | `band` | `0` 87.5–108, `1` 76–108, `2` 76–90, `3` 64–76 (MHz). Ignored when `action = 0` |
+
+**The wire carries Hz, and off-raster frequencies are refused rather than rounded.** The BK1080
+tunes on a 100 kHz raster. `0x0873` silently truncates sub-10 Hz detail, because 10 Hz of a repeater
+channel is nothing — but 100 kHz of the broadcast band is **a whole adjacent station**, so anything
+off the raster comes back `ERR_FIELD` and the receiver does not move. If you want 103.2 MHz, send
+`103200000`. **Refused, never rounded.**
+
+**The band is on the wire because the firmware would clamp it silently.** Its own field for the band
+is two bits wide, so a `4` becomes a `0` inside the assignment with no diagnostic anywhere, leaving
+the radio on 87.5–108 while you believe otherwise. Values above `3` are refused here instead. A
+frequency outside the band you named is refused too, with `ERR_BAND` — and that one is not just
+tidiness: the driver computes the channel as `frequency - low_limit` in unsigned 16-bit arithmetic
+with no guard, so a frequency under the floor would wrap to an enormous channel number.
+
+**`action = 2` (tune) is not a cheaper `action = 1`.** `1` brings the chip up and takes the speaker;
+`2` only moves a receiver that is already running, at the cost of three I²C writes. Tuning while the
+receiver is off is refused with `ERR_OFF` rather than quietly promoted to an on — stepping across
+the band must not be able to switch your station deaf by accident.
+
+**`action = 0` (off) is never refused for the fields it ignores.** An off carrying a stale
+off-raster frequency or an out-of-range band still turns the receiver off. Turning it off is how you
+give the station its ears back, and that direction always stays available.
+
+### Reply `0x087A` — 8 bytes, sent for every outcome
+
+| Offset | Type | Field |
+|---|---|---|
+| 0 | u8 | `status` |
+| 1 | u8 | `state` — `0` off, `1` on, or `0xFF` |
+| 2–5 | u32 LE | `freq_hz` — where the receiver **is**, in Hz, or `0` |
+| 6 | u8 | `band` — `0`–`3`, or `0xFF` |
+| 7 | u8 | `flags` — bit 0: the radio will key its own transmit path (see the warning above) |
+
+| `status` | Meaning |
+|---|---|
+| `0` | applied, exactly as requested |
+| `1` | payload was shorter than 6 bytes |
+| `2` | busy — the host holds full control (`0x0870`); retry after `0x0871` |
+| `4` | unknown `action`, `band` above `3`, or a frequency off the 100 kHz raster |
+| `5` | firmware built without the radio-side binding (no `ENABLE_FMRADIO`) |
+| `6` | the frequency is outside the band you named |
+| `8` | the radio is transmitting or monitoring — retry when it is not |
+| `9` | `action = 2` (tune) with the receiver off |
+
+The numbers are `0x0874`'s again, holes and all: `3` and `7` cannot arise here. `8` and `9` are new
+to the shared table and belong to it rather than to this command — no `0x0874` or `0x0878` can
+produce them, so one status table still decodes everything on this wire.
+
+`state`, `freq_hz` and `band` are read back out of the firmware's own state **after** it applied,
+not echoed from your request. That is how you see the raster and the band field doing whatever they
+do without having to model them yourself.
+
+> **On any non-zero status, `state` and `band` are `0xFF` and `freq_hz` is `0`.** Three fields, and
+> deliberately not one shared sentinel: `0` is a perfectly real reading of `state` (off) and of
+> `band` (87.5–108, the one most hosts want), so blanking either to `0` would answer a refusal with a
+> specific and possibly wrong claim. `0` is *not* a real reading of `freq_hz`, so it blanks to `0`
+> exactly as `0x0874`'s frequencies do.
+
+> **`status 8` exists because two different things can be keying.** The radio's own transmit state
+> covers the PTT pin and the front panel. It does **not** cover a host keying by writing `REG_30`
+> over `0x0850` — that never enters the firmware's transmit bookkeeping, so the radio believes it is
+> idle. Both are refused, and both report `8`. This is not an inconsistency with `0x0873`/`0x0877`,
+> which do apply mid-transmission: their state survives the over, and this one does not — the
+> firmware powers the BK1080 down on key-up, so an on applied mid-over would be torn down at once and
+> the read-back would describe a receiver that is already stopping.
+
+---
+
 ## Golden vectors
 
 Byte-exact frames, verified against both implementations. Use these before you trust your codec.
@@ -336,6 +437,35 @@ deobfuscated payload: `77 08 00 00`
 AB CD 08 00 6E 64 10 E6 2F 6E F2 40 DE CA DC BA
 ```
 deobfuscated payload: `78 08 04 00 01 FF FF 00`
+
+**`0x0879` request** — broadcast FM on, 103.2 MHz, band 0 (full frame):
+
+```
+AB CD 0A 00 6F 64 12 E6 2F 91 B8 66 27 35 9A 85 DC BA
+```
+deobfuscated payload: `79 08 06 00 01 00 B5 26 06 00`
+
+**its `0x087A` reply** — applied, playing, 103.2 MHz read back, band 0, `flags = 1` (**the radio is
+deaf to its own channel and will still key**):
+
+```
+AB CD 0C 00 6C 64 1C E6 2E 90 0D F5 07 33 D5 41 EC FC DC BA
+```
+deobfuscated payload: `7A 08 08 00 00 01 00 B5 26 06 00 01`
+
+**`0x0879` with an empty payload** — the F8 probe:
+
+```
+AB CD 04 00 6F 64 14 E6 8D 89 DC BA
+```
+deobfuscated payload: `79 08 00 00`
+
+**its `0x087A` reply** — `ERR_SHORT`, naming no state, no frequency and no band:
+
+```
+AB CD 0C 00 6C 64 1C E6 2F 6E 0D 40 21 35 2A 40 EC FC DC BA
+```
+deobfuscated payload: `7A 08 08 00 01 FF 00 00 00 00 FF 00`
 
 ---
 
@@ -413,7 +543,7 @@ proves the command exists just as well as `ERR_SHORT` does.
 - **[`App/app/dock.c`](App/app/dock.c) / [`dock.h`](App/app/dock.h)** are pure C with **no firmware or
   hardware includes** — all hardware sits behind a caller-supplied `dock_hal_t`. You can compile them
   on a host and use them as a reference decoder directly.
-- **[`tests/host/test_dock.c`](tests/host/test_dock.c)** is 98 checks including the golden frames
+- **[`tests/host/test_dock.c`](tests/host/test_dock.c)** is 144 checks including the golden frames
   above. `make -C tests/host run`. It needs nothing but a C compiler.
 - **`radio_server/backends/uvk5/frames.py`** in
   [radio-server](https://github.com/kbennett2000/radio-server) is a complete, independently-written

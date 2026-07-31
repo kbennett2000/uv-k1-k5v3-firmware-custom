@@ -49,6 +49,12 @@
 #include "app/dock.h"
 #include "driver/system.h"
 #include "radio.h"
+#if defined(ENABLE_FMRADIO)
+#include "app/fm.h"                 // F8: broadcast FM (the BK1080) over 0x0879
+#include "driver/bk1080.h"          // its band limit tables — the only copy of them
+#include "functions.h"              // gCurrentFunction, for the keyed/monitoring guard
+#include "ui/ui.h"                  // GUI_SelectNextDisplay
+#endif
 #endif
 
 #if defined(ENABLE_OVERLAY)
@@ -673,9 +679,21 @@ static void Dock_SetVfo(void *user, const dock_vfo_t *want, dock_vfo_applied_t *
 // F7: put the radio on a demodulator (0x0877, below), reporting back through `out` the one it
 // actually ended up on and whether it will still key its own PTT path there (0x0878).
 static void Dock_SetModulation(void *user, uint8_t wire_mod, dock_mod_applied_t *out);
+// F8: drive the BK1080 broadcast-FM receiver (0x0879, below), reporting back through
+// `out` what it is now doing (0x087A). NULL on a build without ENABLE_FMRADIO, where
+// the chip's driver is not compiled in at all — 0x0879 then answers DOCK_FM_ERR_NO_HAL,
+// which is a different fact from the silence that means "no such command".
+#if defined(ENABLE_FMRADIO)
+static void Dock_SetFm(void *user, const dock_fm_t *fm, dock_fm_applied_t *out);
+#endif
 static const dock_hal_t Dock_Hal = {
     Dock_HalRead, Dock_HalWrite, Dock_HalSend, NULL, Dock_TxSet, Dock_SetVfo,
-    Dock_SetModulation
+    Dock_SetModulation,
+#if defined(ENABLE_FMRADIO)
+    Dock_SetFm
+#else
+    NULL
+#endif
 };
 static dock_ctx_t Dock_Ctx;
 static bool       Dock_Inited = false;
@@ -714,6 +732,32 @@ static void Dock_ForceRxAudioAlive(void)
     gEnableSpeaker = true;
     BK4819_SetAF(BK4819_AF_FM);         // REG_47 = 0x6142 (unmute)
     BK4819_SetRxAudioGain();            // REG_48 — normal RX AF/DAC gain from EEPROM
+}
+
+// F8 — give the BK1080 its speaker back after anything that called
+// RADIO_SetupRegisters. That function opens with AUDIO_AudioPathOff() and
+// gEnableSpeaker = false (radio.c) and does NOT clear gFmRadioMode, so every dock glue
+// path that ends in it leaves a running, correctly-tuned broadcast receiver playing to
+// a dead amplifier — with no timer to fix it, because gFM_RestoreCountdown_10ms is only
+// armed on leaving TX/RX. That is the F3a fault in mirror image and it is invisible to
+// the host tests, which cannot compile this file.
+//
+// This changes nothing about F7 behaviour, and not as a mitigation: the state it repairs
+// cannot exist until 0x0879 creates it, because before F8 nothing but a thumb on the
+// front panel could set gFmRadioMode, and a thumb is not driving 0x0873 at the same time.
+//
+// Call it after EVERY RADIO_SetupRegisters in the dock block. tests/host/Makefile's
+// `check-fm-restore` target enforces that mechanically — it is a grep over this file,
+// not a proof of behaviour, and it exists because the real proof is not expressible:
+// uart.c is not host-compiled, by design (dock.c's purity is guardrail 4).
+static void Dock_RestoreFmAudio(void)
+{
+#if defined(ENABLE_FMRADIO)
+    if (gFmRadioMode) {
+        GPIO_EnableAudioPath();
+        gEnableSpeaker = true;
+    }
+#endif
 }
 
 // F5 — engage the physical PA on a dock-mode key. radio-server keys TX by writing
@@ -966,6 +1010,7 @@ static void Dock_SetVfo(void *user, const dock_vfo_t *want, dock_vfo_applied_t *
 
     RADIO_SelectVfos();
     RADIO_SetupRegisters(true);
+    Dock_RestoreFmAudio();              // F8 — it just muted a running BK1080
 
     // Report the channel the radio is on, read back out of its own struct after
     // RADIO_ApplyOffset — not the values that were asked for.
@@ -1009,6 +1054,7 @@ static void Dock_SetModulation(void *user, uint8_t wire_mod, dock_mod_applied_t 
 
     RADIO_SelectVfos();
     RADIO_SetupRegisters(true);
+    Dock_RestoreFmAudio();              // F8 — it just muted a running BK1080
 
     // Read back out of the radio's own struct, not from `mod` — if the map above were wrong,
     // echoing the request is exactly what would hide it. This is why 0x0874 reports power.
@@ -1018,6 +1064,181 @@ static void Dock_SetModulation(void *user, uint8_t wire_mod, dock_mod_applied_t 
     out->flags      = Dock_ModulationCanTx(applied) ? DOCK_MOD_FLAG_TX_OK : 0u;
     out->status     = DOCK_MOD_APPLIED;
 }
+
+#if defined(ENABLE_FMRADIO)
+// 0x0879 set-FM — bring the BK1080 up, retune it, or shut it down.
+//
+// WHY THIS DOES NOT SIMPLY CALL FM_Start() / FM_TurnOff().
+//
+// Both of them end in SETTINGS_WriteCurrentState() (fm.c, under
+// ENABLE_FEAT_F4HWN_RESUME_STATE, which this preset sets). That is a flash sector erase —
+// PY25Q16_WriteBuffer's own comment puts it at ~300 ms — spinning in WaitWIP inside this
+// UART handler, and CURRENT_STATE genuinely flips 0<->3 on each transition, so the
+// memcmp short-circuit does not save it. Flash wear on a command a host may send often,
+// and a stalled main loop while it happens.
+//
+// And the persistence itself is wrong for a host-commanded state: CURRENT_STATE = 3 makes
+// main.c re-enter broadcast FM on the NEXT POWER-ON, so a dock session would leave a radio
+// that boots deaf with no host present.
+//
+// So the ON leg reproduces FM_Start's work without the write. It is a duplicate of eight
+// lines of fm.c and that is a real drift hazard, named rather than hidden.
+//
+// THE OFF LEG DOES WRITE, AND THAT IS NOT AN EXCEPTION TO THE ABOVE.
+//
+// The firmware persists FM mode behind us regardless: app.c's gFM_RestoreCountdown_10ms
+// expiry calls FM_Start() — write and all — about five seconds after any squelch close
+// while gFmRadioMode is set (armed in FUNCTION_Foreground). No command path can prevent
+// that. If OFF also declined to write, flash would be left at CURRENT_STATE = 3 for good
+// and the radio would boot into broadcast FM for ever after. Clearing a bit the firmware
+// set is not the same act as routing a command through SETTINGS_Save*; it is the only way
+// to undo one. It costs nothing when the firmware never set it — PY25Q16_WriteBuffer
+// short-circuits on memcmp — and one erase exactly when it did.
+static void Dock_FmOn(uint16_t raster, uint8_t band)
+{
+    // FM_Start's work, minus SETTINGS_WriteCurrentState. Kept in FM_Start's order.
+    gEeprom.FM_FrequencyPlaying = raster;
+    gEeprom.FM_Band             = band;
+
+    gDualWatchActive          = false;
+    gFmRadioMode              = true;
+    gFM_ScanState             = FM_SCAN_OFF;
+    gFM_RestoreCountdown_10ms = 0;
+
+    BK1080_Init(gEeprom.FM_FrequencyPlaying, gEeprom.FM_Band);
+    BK4819_PickRXFilterPathBasedOnFrequency(10320000);   // VHF LNA, as FM_Start does
+    FM_AudioPathOn();                                    // GPIOA8 — the AIOC's line
+
+    gUpdateStatus = true;
+
+    // Directly, NOT via gRequestDisplayScreen: that flag is consumed only at the end of
+    // app.c's ProcessKey, so setting it from a UART handler does nothing until the
+    // operator's next keypress and then fires at a moment nobody asked for. Worse,
+    // GUI_SelectNextDisplay's own side effects would never run — it clears gScanStateDir,
+    // gFM_ScanState and gCssBackgroundScan, which is where ACTION_FM gets "turning FM on
+    // stops the scan" from. Without it a dock FM-on leaves a scan running, and every scan
+    // hit calls APP_StartListening -> BK1080_Init0() and kills the audio.
+    //
+    // The screen matters beyond tidiness: GENERIC_Key_PTT decides whether PTT starts a
+    // transmission by testing gScreenToDisplay == DISPLAY_FM. Leaving the display alone
+    // would split host-initiated and operator-initiated broadcast FM into two radio states
+    // that only look identical — one radio, two behaviours, which is exactly what
+    // radio-server's ADR 0137 says not to build. The dead keypad (main.c refuses every key
+    // but PTT and EXIT once gFmRadioMode is set) is the second reason, not the first.
+    GUI_SelectNextDisplay(DISPLAY_FM);
+}
+
+static void Dock_FmOff(void)
+{
+    // FM_TurnOff's work, plus the CURRENT_STATE clear it would have done.
+    gFmRadioMode              = false;
+    gFM_ScanState             = FM_SCAN_OFF;
+    gFM_RestoreCountdown_10ms = 0;
+
+    GPIO_DisableAudioPath();           // FM_TurnOff spells this AUDIO_AudioPathOff(),
+    gEnableSpeaker = false;            // which is audio.h's macro for exactly this call.
+                                       // Spelled directly to match Dock_ForceRxAudioAlive
+                                       // above, which already uses the GPIO_* pair.
+    BK1080_Init0();
+    BK4819_PickRXFilterPathBasedOnFrequency(gRxVfo->freq_config_RX.Frequency);
+
+    gUpdateStatus = true;
+
+    // ACTION_FM's off leg does this through gFlagReconfigureVfos, consumed inside
+    // ProcessKey — same no-op-from-here problem as the display flag, so inline. These are
+    // the two lines Dock_SetVfo already ends with.
+    RADIO_SelectVfos();
+    RADIO_SetupRegisters(true);
+    Dock_RestoreFmAudio();              // no-op here — gFmRadioMode is already false
+
+    GUI_SelectNextDisplay(DISPLAY_MAIN);
+
+    // The write, and only here. See the note above: this undoes what app.c's restore
+    // countdown put in flash behind us, and skipping it strands the radio booting into
+    // broadcast FM. It also flushes SCAN_LIST_DEFAULT, SCAN_LIST_ENABLED,
+    // SCANLIST_PRIORITY_CH and CHAN_1_CALL out of RAM — an unrelated divergence rides
+    // along, which is a cost of using the firmware's own function rather than a reason
+    // to hand-roll a narrower one.
+    gEeprom.CURRENT_STATE = 0;
+    SETTINGS_WriteCurrentState();
+}
+
+static void Dock_SetFm(void *user, const dock_fm_t *fm, dock_fm_applied_t *out)
+{
+    UNUSED(user);
+
+    // The other half of the interlock. dock.c already refused if the DOCK holds the key
+    // (ctx->tx_on); this is the half it cannot see — the PTT pin and the front panel,
+    // which go through FUNCTION_Select and land in gCurrentFunction.
+    //
+    // Both terms of ACTION_FM's own guard are mirrored, not just the obvious one. MONITOR
+    // is in scope because it holds the audio path open for the operator, and taking the
+    // speaker from someone who is listening is the same discourtesy as taking it mid-over.
+    //
+    // This is NOT an exception to 0x0873 and 0x0877, which do apply mid-over. Their state
+    // survives the over; this one does not — FUNCTION_Transmit calls BK1080_Init0() on
+    // key-up, so an FM-on applied here would be torn down immediately and the read-back
+    // below would report ON for a receiver already being shut off. That would break the
+    // 0x0874 doctrine rather than merely be untidy.
+    if (gCurrentFunction == FUNCTION_TRANSMIT || gCurrentFunction == FUNCTION_MONITOR) {
+        out->status = DOCK_FM_ERR_TX;
+        return;
+    }
+
+    if (fm->action == DOCK_FM_TUNE && !gFmRadioMode) {
+        // TUNE is not a cheaper ON — see dock.h. Only this side can tell the difference.
+        out->status = DOCK_FM_ERR_OFF;
+        return;
+    }
+
+    if (fm->action != DOCK_FM_OFF) {
+        // dock.c has already refused anything off the 100 kHz raster, so this division is
+        // exact by construction — but the BAND LIMITS live here, because they live in the
+        // BK1080 driver's own tables and a second copy in dock.c would be a hardware fact
+        // maintained in two places. Refusing is not only doctrine: BK1080_SetFrequency
+        // computes `channel = frequency - loLimit` in uint16 with no guard, so a frequency
+        // below the band floor UNDERFLOWS into a huge channel number.
+        const uint32_t raster32 = fm->freq_hz / DOCK_FM_RASTER_HZ;
+        const uint16_t lo = BK1080_GetFreqLoLimit(fm->band);
+        const uint16_t hi = BK1080_GetFreqHiLimit(fm->band);
+
+        if (raster32 < lo || raster32 > hi) {
+            out->status = DOCK_FM_ERR_BAND;
+            return;
+        }
+
+        const uint16_t raster = (uint16_t)raster32;
+        if (fm->action == DOCK_FM_ON) {
+            Dock_FmOn(raster, fm->band);
+        } else {
+            // TUNE on a running receiver: three I2C writes and nothing else. No flash, no
+            // BK1080_Init, no display change, and the audio path stays up — deliberately
+            // unlike FM_Tune, which mutes on the way in because it is built for the scan
+            // engine's tune-then-lock loop.
+            gEeprom.FM_FrequencyPlaying = raster;
+            gEeprom.FM_Band             = fm->band;
+            FM_SetFrequency();
+        }
+    } else {
+        Dock_FmOff();
+    }
+
+    // Read back out of the firmware's own state, not from `fm` — the 0x0874 doctrine. Here
+    // it is load-bearing twice over: the raster conversion and the two-bit FM_Band field
+    // are both places where what the radio holds can differ from what was sent, and
+    // echoing the request is exactly what would hide either.
+    out->state   = gFmRadioMode ? DOCK_FM_STATE_ON : DOCK_FM_STATE_OFF;
+    out->freq_hz = (uint32_t)gEeprom.FM_FrequencyPlaying * DOCK_FM_RASTER_HZ;
+    out->band    = gEeprom.FM_Band;
+    // Same bit and same meaning as 0x0878's, and deliberately NOT about broadcast FM:
+    // it is the BK4819 demodulator that decides whether this radio will key its own PTT
+    // path, and the BK1080 does not touch it. Reported here so a host holding only this
+    // frame can see the real and dangerous combination — deaf, and still transmitting.
+    out->flags   = Dock_ModulationCanTx(gEeprom.VfoInfo[0].Modulation)
+                 ? DOCK_FM_FLAG_TX_OK : 0u;
+    out->status  = DOCK_FM_APPLIED;
+}
+#endif // ENABLE_FMRADIO
 
 // 0x0870 enter full-control: force RX audio alive (above), then block here,
 // re-entrantly servicing register R/W until 0x0871 clears the flag. While blocked,
@@ -1037,6 +1258,7 @@ static void Dock_EnterFullControl(uint32_t Port)
             UART_HandleCommand(Port);   // routes 0x0850/0x0851/0x0871 to dock
     }
     RADIO_SetupRegisters(true);         // resume normal (muted) RX on exit
+    Dock_RestoreFmAudio();              // F8 — it just muted a running BK1080
 }
 #endif // ENABLE_DOCK
 
@@ -1269,6 +1491,7 @@ void UART_HandleCommand(uint32_t Port)
         case 0x0851:   // read BK4819 registers -> one 0x0951 reply each
         case 0x0871:   // exit full-control (clears the loop flag)
         case 0x0873:   // set the radio's own VFO -> one 0x0874 reply — F6
+        case 0x0879:   // drive the BK1080 broadcast receiver -> one 0x087A reply — F8
         case 0x0877:   // set the radio's modulation -> one 0x0878 reply — F7
             // Both sit HERE, in the ordinary non-blocking dispatch, and not with
             // 0x0870 below. That is the point of them: the main loop keeps
