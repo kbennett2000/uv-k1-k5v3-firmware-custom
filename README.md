@@ -65,8 +65,8 @@ Each cycle unlocked something the one before it lacked. Releases are tagged `rad
 | **F5** | engages the power amplifier on the key-up edge | keys cleanly and **radiates nothing usable** |
 | **F6** | `0x0873`/`0x0874` set-VFO | tuning does not survive `0x0871`; no transmit-power control |
 | **F7** | `0x0877`/`0x0878` set-modulation; `0x0873` stops forcing FM | the radio is FM-only — there is no way to receive AM |
-| **F8** | `0x0879`/`0x087A` set-broadcast-FM — the BK1080 second receiver | no way to reach the second receiver, or to switch it back off |
-| **F9** | refuses to transmit while broadcast FM is running (Fusion), and reports it on `0x087A` | the radio transmits into a channel it cannot hear, station ID included |
+| **F8** | `0x0879`/`0x087A` broadcast FM — reach and report the BK1080 second receiver | a host cannot tell that the radio's FM radio is holding the speaker, so the station is deaf on its own channel and nothing says so |
+| **F9** | refuses to key while broadcast FM is running, and reports it in `0x087A` flags bit 1 | the radio transmits normally while deaf — it cannot hear the channel it is transmitting on, station ID included |
 
 **[Flash F9](../../releases/tag/radio-server-f9-v5.7.0).** It is cumulative. F3 and F5 are the two
 that cost a diagnostic cycle each to find, and neither is visible from the host as a fault — the radio
@@ -93,7 +93,7 @@ costs about 1 KB of it.
 ## Test
 
 ```sh
-make -C tests/host run      # 144 checks, needs only a C compiler
+make -C tests/host run      # 161 checks, needs only a C compiler
 ```
 
 `App/app/dock.c` is pure C with no firmware or hardware includes — all hardware sits behind a
